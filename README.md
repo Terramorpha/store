@@ -20,13 +20,13 @@ its outputs.
 
 ```python
 from pathlib import Path
-from store import OUTPUT, DownloadFile, derivation, realize
+from store import DownloadFile, derivation, output, realize
 
 archive = DownloadFile("data.tar.gz", "https://example.org/data.tar.gz", hash=None)
 
 @derivation("summary.json")
 def summarize(archive: Path, threshold: float) -> None:
-    out = OUTPUT.get()          # where to write; set by realize()
+    out = output()              # where to write; bound by realize()
     ...
     out.write_text("...")
 

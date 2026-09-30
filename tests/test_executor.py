@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from store import (
-    OUTPUT,
+    output,
     Constant,
     LocalExecutor,
     RealizeError,
@@ -30,7 +30,7 @@ def _sleeper(pool="default", isolate=False):
     @derivation(lambda tag, dt: f"{tag}.txt", pool=pool, isolate=isolate)
     def f(tag: str, dt: float) -> None:
         time.sleep(dt)
-        OUTPUT.get().write_text(f"{tag} {os.getpid()}")
+        output().write_text(f"{tag} {os.getpid()}")
 
     return f
 
@@ -68,7 +68,7 @@ def test_pool_capacity_is_respected(store_path: Path):
             time.sleep(0.15)
             with lock:
                 cur[pool] -= 1
-            OUTPUT.get().write_text(tag)
+            output().write_text(tag)
 
         return f
 
@@ -87,13 +87,13 @@ def test_dependencies_run_before_dependents_and_share_results(store_path: Path):
         time.sleep(0.1)
         with lock:
             order.append("base")
-        OUTPUT.get().write_text("3")
+        output().write_text("3")
 
     @derivation(lambda b, k: f"child{k}.txt")
     def child(b: Path, k: int) -> None:
         with lock:
             order.append(f"child{k}")
-        OUTPUT.get().write_text(str(int(b.read_text()) * k))
+        output().write_text(str(int(b.read_text()) * k))
 
     b = base()
     outs = realize(
@@ -111,11 +111,11 @@ def test_failure_blocks_dependents_but_not_independent_work(store_path: Path):
 
     @derivation("after_bad.txt")
     def after_bad(b: Path) -> None:
-        OUTPUT.get().write_text("never")
+        output().write_text("never")
 
     @derivation("good.txt")
     def good() -> None:
-        OUTPUT.get().write_text("ok")
+        output().write_text("ok")
 
     with pytest.raises(RealizeError) as ei:
         realize(
@@ -139,7 +139,7 @@ def test_fail_fast_raises_immediately(store_path: Path):
     @derivation("slow.txt")
     def slow() -> None:
         time.sleep(2.0)
-        OUTPUT.get().write_text("slow")
+        output().write_text("slow")
 
     t0 = time.time()
     with pytest.raises(RealizeError):
@@ -162,7 +162,7 @@ def test_expression_is_evaluated_once_per_realization(store_path: Path):
 
     @derivation(lambda v, k: f"use{k}.txt")
     def use(v: int, k: int) -> None:
-        OUTPUT.get().write_text(str(v * k))
+        output().write_text(str(v * k))
 
     e = shared()
     outs = realize(
@@ -193,7 +193,7 @@ def test_isolated_builder_failure_is_reported(store_path: Path):
 def test_live_lock_makes_second_realizer_wait_for_the_output(store_path: Path):
     @derivation("shared.txt")
     def shared() -> None:
-        OUTPUT.get().write_text("mine")
+        output().write_text("mine")
 
     d = shared()
     store_path.mkdir()
@@ -216,7 +216,7 @@ def test_live_lock_makes_second_realizer_wait_for_the_output(store_path: Path):
 def test_stale_lock_is_taken_over(store_path: Path):
     @derivation("stale.txt")
     def stale() -> None:
-        OUTPUT.get().write_text("rebuilt")
+        output().write_text("rebuilt")
 
     d = stale()
     store_path.mkdir()
@@ -232,12 +232,12 @@ def test_stale_lock_is_taken_over(store_path: Path):
 def test_nested_realize_inside_a_builder(store_path: Path):
     @derivation("inner.txt")
     def inner() -> None:
-        OUTPUT.get().write_text("inner")
+        output().write_text("inner")
 
     @derivation("outer.txt")
     def outer() -> None:
         p = realize(store_path, inner())  # builders may realize on their own
-        OUTPUT.get().write_text(p.read_text() + "+outer")
+        output().write_text(p.read_text() + "+outer")
 
     assert (
         realize(store_path, outer(), executor=LocalExecutor({"default": 2})).read_text()
@@ -248,7 +248,19 @@ def test_nested_realize_inside_a_builder(store_path: Path):
 def test_list_of_roots_returns_values_in_order(store_path: Path):
     @derivation("x.txt")
     def x() -> None:
-        OUTPUT.get().write_text("x")
+        output().write_text("x")
 
     res = realize(store_path, [Constant(1), x(), Constant("c")])
     assert res[0] == 1 and res[1].read_text() == "x" and res[2] == "c"
+
+
+def test_legacy_output_alias_works_including_isolated(store_path: Path):
+    from store import OUTPUT
+
+    @derivation("legacy.txt", isolate=True)
+    def legacy() -> None:
+        OUTPUT.get().write_text("legacy")
+
+    assert realize(store_path, legacy()).read_text() == "legacy"
+    with pytest.raises(RuntimeError, match="outside of a builder"):
+        OUTPUT.get()

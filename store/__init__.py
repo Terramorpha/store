@@ -24,6 +24,7 @@ from store.core import (
     derivation,
     expression,
     hash_directory_tree,
+    output,
     realize,
 )
 
@@ -51,5 +52,6 @@ __all__ = [
     "derivation",
     "expression",
     "hash_directory_tree",
+    "output",
     "realize",
 ]

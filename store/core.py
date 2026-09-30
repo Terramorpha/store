@@ -6,7 +6,6 @@ See the package README for the model. Everything public is re-exported from
 """
 
 import concurrent.futures
-import copyreg
 import hashlib
 import inspect
 import json
@@ -35,22 +34,35 @@ from rich.progress import DownloadColumn, Progress, TransferSpeedColumn
 
 logger = logging.getLogger(__name__)
 
-# Context variable holding the path a builder must write its output to.
-# Set by realize() around each builder call; read with OUTPUT.get().
-OUTPUT: ContextVar[Path] = ContextVar("OUTPUT")
+# Where the builder currently being run must write its output. Bound by the
+# realizer around each builder call (per thread / per isolated child); builders
+# read it through output(), never through the variable itself.
+_OUTPUT: ContextVar[Path] = ContextVar("OUTPUT")
 
 
-def _contextvar_by_name(name: str) -> ContextVar:
-    if name == "OUTPUT":
-        return OUTPUT
-    raise ValueError(f"cannot unpickle ContextVar {name!r}")
+def output() -> Path:
+    """The path the running builder must write its output to (a file or a
+    directory; the builder decides). Only meaningful inside a builder."""
+    try:
+        return _OUTPUT.get()
+    except LookupError:
+        raise RuntimeError("store.output() called outside of a builder") from None
 
 
-# A builder closure usually references OUTPUT; when cloudpickle ships such a
-# closure to an isolated child it serialises the closure's globals by value,
-# and a ContextVar is not picklable. Pickle it by NAME instead: the child
-# resolves it to its own store.core.OUTPUT.
-copyreg.pickle(type(OUTPUT), lambda v: (_contextvar_by_name, (v.name,)))
+class _OutputAlias:
+    """Compatibility shim for builders written as ``OUTPUT.get()``: a plain,
+    stateless singleton whose ``get()`` is :func:`output`. Being an ordinary
+    object it pickles like any other global, so legacy builders work under
+    ``isolate=True`` too."""
+
+    def get(self) -> Path:
+        return output()
+
+    def __repr__(self) -> str:
+        return "OUTPUT"
+
+
+OUTPUT = _OutputAlias()
 
 
 DEFAULT_POOL = "default"
@@ -164,16 +176,16 @@ def _remove_path(p: Path) -> None:
 def _run_builder(
     derivation: Derivation, realized_deps: list[Any], tmp_output_path: Path
 ) -> None:
-    """Call the builder with OUTPUT bound to ``tmp_output_path``, in this
+    """Call the builder with output() bound to ``tmp_output_path``, in this
     thread or (``isolate``) in a fresh interpreter."""
     if derivation.isolate:
         _run_isolated(derivation, realized_deps, tmp_output_path)
         return
-    token = OUTPUT.set(tmp_output_path)
+    token = _OUTPUT.set(tmp_output_path)
     try:
         derivation.builder(realized_deps)
     finally:
-        OUTPUT.reset(token)
+        _OUTPUT.reset(token)
 
 
 def _run_isolated(
@@ -181,7 +193,7 @@ def _run_isolated(
 ) -> None:
     """Run the builder in a child interpreter: the builder closure, its
     realized dependencies and the output path are cloudpickled to a file,
-    ``python -m store._isolated <file>`` loads them, binds OUTPUT and calls
+    ``python -m store._isolated <file>`` loads them, binds output() and calls
     the builder. The child inherits this process's environment and cwd."""
     import cloudpickle
 
@@ -294,7 +306,7 @@ def _build_derivation(
             file_path = inspect.getsourcefile(derivation.builder)
             _lines, start_line = inspect.getsourcelines(derivation.builder)
             raise Exception(
-                f"derivation {derivation.name} did not produce an output at OUTPUT.get(). "
+                f"derivation {derivation.name} did not produce an output at output(). "
                 f"Perhaps make the builder at {file_path}:{start_line} not silently fail?"
             )
         if (
@@ -623,7 +635,7 @@ def derivation(
 
     The constructed builder takes only the realized dependency values. During
     realization, the output path is made available via the ContextVar
-    ``OUTPUT`` (``OUTPUT.get()`` inside the function body).
+    ``output()`` called inside the function body.
     """
 
     def compute_name(args, kwargs):
@@ -644,7 +656,7 @@ def derivation(
                 name=der_name,
                 hash=compute_hash(func, der_name, args, kwargs),
                 dependencies=dependencies,
-                builder=builder,  # returns None; writes to OUTPUT.get()
+                builder=builder,  # returns None; writes to output()
                 pool=pool,
                 isolate=isolate,
             )
@@ -671,7 +683,7 @@ def DownloadFile(
         derivation_hash = h.digest()
 
     def builder(_):
-        out = OUTPUT.get()
+        out = output()
 
         # Get progress object and create a task
 
@@ -739,10 +751,10 @@ def DownloadFile(
 def ExtractTarball(input_der: Derivation):
     @derivation(input_der.name.removesuffix(".tar.gz"))
     def inner(input: Path):
-        output = OUTPUT.get()
+        dst = output()
 
         with tarfile.open(input, "r:gz") as tar:
-            tar.extractall(path=output)
+            tar.extractall(path=dst)
 
     return inner(input_der)
 
@@ -750,7 +762,7 @@ def ExtractTarball(input_der: Derivation):
 def ExtractZip(input_der: Derivation):
     @derivation(input_der.name.removesuffix(".zip"))
     def inner(input: Path):
-        dst = OUTPUT.get()
+        dst = output()
 
         dst.mkdir()
 
@@ -766,7 +778,7 @@ def ExtractZip(input_der: Derivation):
 def ExtractFromZip(zip_file: Realizable, filename: str) -> Derivation:
     @derivation(Path(filename).name)
     def inner(input: Path, name: str):
-        dst = OUTPUT.get()
+        dst = output()
         with zipfile.ZipFile(input, "r") as zip_ref:
             with zip_ref.open(name) as src, open(dst, "wb") as out:
                 shutil.copyfileobj(src, out)
@@ -807,7 +819,7 @@ def GitClone(
     hasher_factory=hashlib.sha256,
 ) -> Derivation:
     def builder(_):
-        dst = OUTPUT.get()
+        dst = output()
 
         hasher = hasher_factory()
 
@@ -849,7 +861,7 @@ def LocalFile(filepath: Path) -> Derivation:
     h = hasher.digest()
 
     def builder(_):
-        dst = OUTPUT.get()
+        dst = output()
 
         shutil.copy(filepath, dst)
 
@@ -858,7 +870,7 @@ def LocalFile(filepath: Path) -> Derivation:
 
 def LocalSymlink(name: str, filepath: Path) -> Derivation:
     def builder(_):
-        dst = OUTPUT.get()
+        dst = output()
 
         dst.symlink_to(filepath)
 
@@ -876,7 +888,7 @@ def Symlink(name: str, input: FileLike) -> Derivation:
 
     @derivation(name)
     def builder(input: Path):
-        dst = OUTPUT.get()
+        dst = output()
         dst.symlink_to(input)
 
     return builder(input)
@@ -885,7 +897,7 @@ def Symlink(name: str, input: FileLike) -> Derivation:
 def Rename(name: str, input: Realizable) -> Derivation:
     @derivation(name)
     def builder(input: Path):
-        dst = OUTPUT.get()
+        dst = output()
         if input.is_file():
             shutil.copy(input, dst)
         elif input.is_dir():

@@ -15,7 +15,7 @@ import git
 import pytest
 
 from store import (
-    OUTPUT,
+    output,
     ChildFile,
     Constant,
     Derivation,
@@ -51,7 +51,7 @@ def test_derivation_is_built_once_and_named_by_hash(store_path: Path):
     @derivation("greeting.txt")
     def greet(who: str) -> None:
         calls.append(1)
-        OUTPUT.get().write_text(f"hello {who}")
+        output().write_text(f"hello {who}")
 
     d = greet("world")
     assert isinstance(d, Derivation)
@@ -66,11 +66,11 @@ def test_derivation_is_built_once_and_named_by_hash(store_path: Path):
 def test_hash_depends_on_arguments_and_function_source(store_path: Path):
     @derivation("a.txt")
     def f(x: int) -> None:
-        OUTPUT.get().write_text(str(x))
+        output().write_text(str(x))
 
     @derivation("a.txt")
     def g(x: int) -> None:
-        OUTPUT.get().write_text(str(x + 0))  # different source text
+        output().write_text(str(x + 0))  # different source text
 
     assert f(1).hash != f(2).hash
     assert f(1).hash != g(1).hash
@@ -80,11 +80,11 @@ def test_hash_depends_on_arguments_and_function_source(store_path: Path):
 def test_realizable_arguments_become_dependencies_and_feed_the_hash(store_path: Path):
     @derivation("base.txt")
     def base(n: int) -> None:
-        OUTPUT.get().write_text("x" * n)
+        output().write_text("x" * n)
 
     @derivation("len.txt")
     def length(base_path: Path) -> None:
-        OUTPUT.get().write_text(str(len(base_path.read_text())))
+        output().write_text(str(len(base_path.read_text())))
 
     d = length(base(3))
     assert [dep.hash for dep in d.dependencies] == [base(3).hash]
@@ -96,7 +96,7 @@ def test_realizable_arguments_become_dependencies_and_feed_the_hash(store_path: 
 def test_derivation_name_can_be_computed_from_arguments(store_path: Path):
     @derivation(lambda tag: f"{tag}.txt")
     def f(tag: str) -> None:
-        OUTPUT.get().write_text(tag)
+        output().write_text(tag)
 
     assert f("abc").name == "abc.txt"
     assert realize(store_path, f("abc")).name.endswith("-abc.txt")
@@ -120,7 +120,7 @@ def test_builder_that_writes_nothing_fails_loudly(store_path: Path):
 def test_partial_temp_output_is_not_mistaken_for_a_build(store_path: Path):
     @derivation("out.txt")
     def f() -> None:
-        OUTPUT.get().write_text("ok")
+        output().write_text("ok")
 
     d = f()
     store_path.mkdir()
@@ -134,7 +134,7 @@ def test_partial_temp_output_is_not_mistaken_for_a_build(store_path: Path):
 def test_builder_output_can_be_a_directory(store_path: Path):
     @derivation("tree")
     def f() -> None:
-        out = OUTPUT.get()
+        out = output()
         out.mkdir()
         (out / "a").write_text("a")
 
@@ -145,11 +145,11 @@ def test_builder_output_can_be_a_directory(store_path: Path):
 def test_output_contextvar_is_reset_after_realization(store_path: Path):
     @derivation("x")
     def f() -> None:
-        OUTPUT.get().write_text("x")
+        output().write_text("x")
 
     realize(store_path, f())
-    with pytest.raises(LookupError):
-        OUTPUT.get()
+    with pytest.raises(RuntimeError, match="outside of a builder"):
+        output()
 
 
 # --- expressions ------------------------------------------------------------
@@ -173,7 +173,7 @@ def test_expression_returns_a_value_and_is_not_cached(store_path: Path):
 def test_expression_over_a_derivation(store_path: Path):
     @derivation("n.txt")
     def n() -> None:
-        OUTPUT.get().write_text("7")
+        output().write_text("7")
 
     @expression()
     def read(p: Path) -> int:
@@ -185,7 +185,7 @@ def test_expression_over_a_derivation(store_path: Path):
 def test_child_file_and_constant(store_path: Path):
     @derivation("dir")
     def d() -> None:
-        out = OUTPUT.get()
+        out = output()
         out.mkdir()
         (out / "inner.txt").write_text("inner")
 
@@ -228,7 +228,7 @@ def test_rename_copies_files_and_directories(tmp_path: Path, store_path: Path):
 
     @derivation("d")
     def d() -> None:
-        out = OUTPUT.get()
+        out = output()
         out.mkdir()
         (out / "x").write_text("x")
 

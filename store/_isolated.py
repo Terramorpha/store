@@ -1,7 +1,7 @@
 """Child-interpreter entry point for ``isolate=True`` derivations.
 
 ``python -m store._isolated <payload.pkl>``: the payload is a cloudpickled
-``(builder, realized_deps, output_path)``; we bind OUTPUT and call the builder.
+``(builder, realized_deps, output_path)``; we bind output() and call the builder.
 Any exception propagates as a non-zero exit with the traceback on stderr.
 """
 
@@ -10,13 +10,13 @@ from pathlib import Path
 
 import cloudpickle
 
-from store.core import OUTPUT
+from store.core import _OUTPUT
 
 
 def main() -> None:
     with open(sys.argv[1], "rb") as f:
         builder, realized_deps, output_path = cloudpickle.load(f)
-    OUTPUT.set(Path(output_path))
+    _OUTPUT.set(Path(output_path))
     builder(realized_deps)
 
 
