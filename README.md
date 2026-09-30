@@ -24,11 +24,13 @@ from store import DownloadFile, derivation, output, realize
 
 archive = DownloadFile("data.tar.gz", "https://example.org/data.tar.gz", hash=None)
 
+
 @derivation("summary.json")
 def summarize(archive: Path, threshold: float) -> None:
-    out = output()              # where to write; bound by realize()
+    out = output()  # where to write; bound by realize()
     ...
     out.write_text("...")
+
 
 path = realize(Path("~/.cache/mystore").expanduser(), summarize(archive, threshold=0.5))
 ```
@@ -50,11 +52,14 @@ slot budget of their **pool**:
 ```python
 from store import LocalExecutor, derivation, realize
 
+
 @derivation("checkpoint", pool="train", isolate=True)
 def train(config: dict, seed: int) -> None: ...
 
+
 @derivation("eval.csv", pool="eval")
 def evaluate(checkpoint: Path) -> None: ...
+
 
 ex = LocalExecutor({"train": 3, "eval": 1}, default_pool_size=8)
 evals = realize(store, [evaluate(train(cfg, s)) for s in range(3)], executor=ex)
@@ -78,5 +83,6 @@ evals = realize(store, [evaluate(train(cfg, s)) for s in range(3)], executor=ex)
 
 ```
 uv sync
+uv run ruff format . && uv run ruff check .
 uv run pytest
 ```

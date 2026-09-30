@@ -11,12 +11,12 @@ from pathlib import Path
 import pytest
 
 from store import (
-    output,
     Constant,
     LocalExecutor,
     RealizeError,
     derivation,
     expression,
+    output,
     realize,
 )
 

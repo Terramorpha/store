@@ -16,9 +16,12 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "ruff>=0.6",
 ]
 
 [build-system]
+# hatchling: the PyPA-recommended backend, pure Python (as are its four helper
+# packages), packaged in Guix as python-hatchling; same backend as morel.
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
@@ -28,5 +31,9 @@ packages = ["store"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
-[tool.black]
-target-version = ["py311"]
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

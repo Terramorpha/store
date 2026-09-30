@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import os
 import tarfile
 import zipfile
 from pathlib import Path
@@ -14,8 +13,8 @@ from pathlib import Path
 import git
 import pytest
 
+import store.core as core
 from store import (
-    output,
     ChildFile,
     Constant,
     Derivation,
@@ -32,9 +31,9 @@ from store import (
     derivation,
     expression,
     hash_directory_tree,
+    output,
     realize,
 )
-import store.core as core
 
 
 @pytest.fixture()

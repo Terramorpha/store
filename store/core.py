@@ -21,11 +21,12 @@ import tempfile
 import threading
 import time
 import zipfile
+from collections.abc import Callable
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Generic, TypeVar, Union, overload
+from typing import Any, Generic, TypeVar, overload
 from uuid import uuid4
 
 import git
@@ -82,9 +83,9 @@ class Derivation:
     isolate: bool = False
 
     def __post_init__(self):
-        assert (
-            Path(self.name).name == self.name
-        ), "name of derivation can't contain a slash"
+        assert Path(self.name).name == self.name, (
+            "name of derivation can't contain a slash"
+        )
 
 
 Result = TypeVar("Result")
@@ -97,7 +98,7 @@ class Expression(Generic[Result]):
     builder: Callable[[list[Any]], Result]
 
 
-Realizable = Union[Derivation, Expression]
+Realizable = Derivation | Expression
 
 
 class RealizeError(Exception):
@@ -213,7 +214,8 @@ def _run_isolated(
     if proc.returncode != 0:
         tail = proc.stderr[-4000:]
         raise RuntimeError(
-            f"isolated build of {derivation.name} exited with {proc.returncode}:\n{tail}"
+            f"isolated build of {derivation.name} exited with "
+            f"{proc.returncode}:\n{tail}"
         )
 
 
@@ -245,7 +247,8 @@ class _BuildLock:
                     continue
                 if age > self.executor.lock_stale_after:
                     logger.warning(
-                        f"taking over stale lock {self.path.name} (heartbeat {age:.0f}s old)"
+                        f"taking over stale lock {self.path.name} "
+                        f"(heartbeat {age:.0f}s old)"
                     )
                     self.path.unlink(missing_ok=True)
                     continue
@@ -307,7 +310,8 @@ def _build_derivation(
             _lines, start_line = inspect.getsourcelines(derivation.builder)
             raise Exception(
                 f"derivation {derivation.name} did not produce an output at output(). "
-                f"Perhaps make the builder at {file_path}:{start_line} not silently fail?"
+                f"Perhaps make the builder at {file_path}:{start_line} "
+                "not silently fail?"
             )
         if (
             output_path.exists()
@@ -334,7 +338,7 @@ class _Scheduler:
         self.store_path = store_path
         self.executor = executor
         self.fail_fast = fail_fast
-        self.nodes: dict[tuple[str, bytes], "Realizable"] = {}
+        self.nodes: dict[tuple[str, bytes], Realizable] = {}
         self.deps: dict[tuple[str, bytes], list[tuple[str, bytes]]] = {}
         self.dependents: dict[tuple[str, bytes], set[tuple[str, bytes]]] = {}
         self.results: dict[tuple[str, bytes], Any] = {}
@@ -409,7 +413,8 @@ class _Scheduler:
                     node = self.nodes[k]
                     realized = [self.results[d] for d in self.deps[k]]
                     if isinstance(node, Expression):
-                        # Expressions are cheap glue: evaluate inline, memoised for this run.
+                        # Expressions are cheap glue: evaluate inline,
+                        # memoised for this run.
                         pending.discard(k)
                         try:
                             self.results[k] = node.builder(realized)
@@ -462,7 +467,7 @@ class _Scheduler:
                         raise RealizeError(
                             {_label(node): exc},
                             [_label(self.nodes[b]) for b in self.blocked],
-                        )
+                        ) from exc
 
     def _fail(self, k: tuple[str, bytes], exc: BaseException) -> None:
         logger.error(f"failed: {_label(self.nodes[k])}: {exc!r}")
@@ -599,9 +604,9 @@ def _capture_dependencies_and_builder(func: Callable[..., Any], *args, **kwargs)
     return dependencies, builder
 
 
-def expression() -> (
-    Callable[[Callable[..., Result]], Callable[..., Expression[Result]]]
-):
+def expression() -> Callable[
+    [Callable[..., Result]], Callable[..., Expression[Result]]
+]:
     """Decorator: calling the wrapped function returns an Expression node."""
 
     def decorator(func) -> Callable:
@@ -741,7 +746,9 @@ def DownloadFile(
             h = hasher.digest()
             if hash is not None and hash != h:
                 raise Exception(
-                    f"Hash of download {filename} is wrong. Expected: {hash.hex()}, actual: {h.hex()} (computed using {hasher})"
+                    f"Hash of download {filename} is wrong. "
+                    f"Expected: {hash.hex()}, actual: {h.hex()} "
+                    f"(computed using {hasher})"
                 )
             shutil.move(outfile.name, out)
 
@@ -842,7 +849,9 @@ def GitClone(
             h = hasher.digest()
             if h != expected_hash:
                 raise Exception(
-                    f"Hash of git repo {filename} is wrong. Expected: {expected_hash.hex()}, actual: {h.hex()} (computed using {hasher})"
+                    f"Hash of git repo {filename} is wrong. "
+                    f"Expected: {expected_hash.hex()}, actual: {h.hex()} "
+                    f"(computed using {hasher})"
                 )
         except BaseException:
             shutil.rmtree(tempdir_path, ignore_errors=True)
@@ -880,7 +889,7 @@ def LocalSymlink(name: str, filepath: Path) -> Derivation:
     return Derivation(name, hasher.digest(), [], builder)
 
 
-FileLike = Union[Derivation, Expression[Path]]
+FileLike = Derivation | Expression[Path]
 
 
 def Symlink(name: str, input: FileLike) -> Derivation:
