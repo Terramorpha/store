@@ -13,7 +13,7 @@ from pathlib import Path
 import git
 import pytest
 
-import store.core as core
+import store.derivations as core
 from store import (
     ChildFile,
     Constant,

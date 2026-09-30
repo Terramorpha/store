@@ -10,7 +10,7 @@ from pathlib import Path
 
 import cloudpickle
 
-from store.core import _OUTPUT
+from store.graph import _OUTPUT
 
 
 def main() -> None:

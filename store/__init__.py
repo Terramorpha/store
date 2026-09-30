@@ -1,39 +1,40 @@
 """store: a tiny content-addressed build store (see README.md)."""
 
-from store.core import (
-    DEFAULT_POOL,
-    OUTPUT,
+from store.derivations import (
     ChildFile,
     Constant,
-    Derivation,
     DownloadFile,
-    Expression,
     ExtractFromZip,
     ExtractTarball,
     ExtractZip,
     FileLike,
     Gather,
     GitClone,
-    LocalExecutor,
     LocalFile,
     LocalSymlink,
-    Realizable,
-    RealizeError,
     Rename,
     Symlink,
+    hash_directory_tree,
+)
+from store.executor import LocalExecutor
+from store.graph import (
+    DEFAULT_POOL,
+    OUTPUT,
+    Derivation,
+    Expression,
+    Realizable,
     compute_hash,
     derivation,
     expression,
-    hash_directory_tree,
     output,
-    realize,
 )
+from store.realize import RealizeError, realize
 
 __all__ = [
+    "DEFAULT_POOL",
     "OUTPUT",
     "ChildFile",
     "Constant",
-    "DEFAULT_POOL",
     "Derivation",
     "DownloadFile",
     "Expression",
@@ -43,11 +44,11 @@ __all__ = [
     "FileLike",
     "Gather",
     "GitClone",
-    "LocalFile",
     "LocalExecutor",
+    "LocalFile",
     "LocalSymlink",
-    "RealizeError",
     "Realizable",
+    "RealizeError",
     "Rename",
     "Symlink",
     "compute_hash",
