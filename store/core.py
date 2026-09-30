@@ -5,13 +5,13 @@ See the package README for the model. Everything public is re-exported from
 ``store``.
 """
 
-import concurrent.futures
 import hashlib
 import inspect
 import json
 import logging
 import os
 import pickle
+import queue
 import shutil
 import socket
 import subprocess
@@ -125,7 +125,7 @@ class LocalExecutor:
     behaviour of the original store is ``LocalExecutor()`` (one slot per pool,
     and a single root has nothing to run in parallel with anyway).
 
-    Builds run on worker threads. A builder that spends its time in a
+    Builds run on daemon worker threads. A builder that spends its time in a
     subprocess (EnergyPlus, a training script) releases the GIL, so threads
     are enough; a builder that must not share interpreter state, or that does
     heavy in-process Python work, is declared ``isolate=True`` on its
@@ -174,68 +174,149 @@ def _remove_path(p: Path) -> None:
         pass
 
 
-def _run_builder(
-    derivation: Derivation, realized_deps: list[Any], tmp_output_path: Path
-) -> None:
-    """Call the builder with output() bound to ``tmp_output_path``, in this
-    thread or (``isolate``) in a fresh interpreter."""
-    if derivation.isolate:
-        _run_isolated(derivation, realized_deps, tmp_output_path)
-        return
-    token = _OUTPUT.set(tmp_output_path)
-    try:
-        derivation.builder(realized_deps)
-    finally:
-        _OUTPUT.reset(token)
+class _Build:
+    """One derivation being built: owns its lock, temp path and (for
+    ``isolate``) the child process, so the scheduler can abort it cleanly."""
 
-
-def _run_isolated(
-    derivation: Derivation, realized_deps: list[Any], tmp_output_path: Path
-) -> None:
-    """Run the builder in a child interpreter: the builder closure, its
-    realized dependencies and the output path are cloudpickled to a file,
-    ``python -m store._isolated <file>`` loads them, binds output() and calls
-    the builder. The child inherits this process's environment and cwd."""
-    import cloudpickle
-
-    with tempfile.NamedTemporaryFile(
-        "wb", prefix="store-isolated-", suffix=".pkl", delete=False
-    ) as f:
-        payload = f.name
-        cloudpickle.dump((derivation.builder, realized_deps, tmp_output_path), f)
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "store._isolated", payload],
-            capture_output=True,
-            text=True,
+    def __init__(
+        self,
+        store_path: Path,
+        derivation: Derivation,
+        realized_deps: list[Any],
+        executor: LocalExecutor,
+    ):
+        self.store_path = store_path
+        self.derivation = derivation
+        self.realized_deps = realized_deps
+        self.executor = executor
+        self.output_path = store_path / _label(derivation)
+        self.tmp_output_path = (
+            store_path / f"{_label(derivation)}.tmp-{os.getpid()}-{uuid4().hex}"
         )
-    finally:
-        Path(payload).unlink(missing_ok=True)
-    if proc.returncode != 0:
-        tail = proc.stderr[-4000:]
-        raise RuntimeError(
-            f"isolated build of {derivation.name} exited with "
-            f"{proc.returncode}:\n{tail}"
-        )
+        self.lock: _BuildLock | None = None
+        self.proc: subprocess.Popen | None = None
+        self.aborted = threading.Event()
+
+    def run(self) -> Path:
+        """Build unless the output exists or another realizer finishes it
+        first; returns the output path."""
+        if self.output_path.exists():
+            return self.output_path
+        self.store_path.mkdir(parents=True, exist_ok=True)
+        self.lock = _BuildLock(self.output_path, self.executor, self.aborted)
+        if not self.lock.acquire():
+            return self.output_path
+        try:
+            logger.info(f"building {self.derivation.name}")
+            self._call_builder()
+            if self.aborted.is_set():
+                raise _Aborted()
+            if not self.tmp_output_path.exists():
+                file_path = inspect.getsourcefile(self.derivation.builder)
+                _lines, start_line = inspect.getsourcelines(self.derivation.builder)
+                raise Exception(
+                    f"derivation {self.derivation.name} did not produce an output "
+                    f"at output(). Perhaps make the builder at "
+                    f"{file_path}:{start_line} not silently fail?"
+                )
+            if self.output_path.exists():  # someone else finished first
+                _remove_path(self.tmp_output_path)
+                return self.output_path
+            try:
+                self.tmp_output_path.rename(self.output_path)
+            except FileExistsError:
+                _remove_path(self.tmp_output_path)
+        except BaseException:
+            _remove_path(self.tmp_output_path)
+            raise
+        finally:
+            self.lock.release()
+        return self.output_path
+
+    def _call_builder(self) -> None:
+        if self.derivation.isolate:
+            self._run_isolated()
+            return
+        token = _OUTPUT.set(self.tmp_output_path)
+        try:
+            self.derivation.builder(self.realized_deps)
+        finally:
+            _OUTPUT.reset(token)
+
+    def _run_isolated(self) -> None:
+        """Run the builder in a child interpreter: the closure, its realized
+        dependencies and the output path are cloudpickled to a file and
+        ``python -m store._isolated <file>`` binds output() and calls it. The
+        child inherits this process's environment and cwd."""
+        import cloudpickle
+
+        with tempfile.NamedTemporaryFile(
+            "wb", prefix="store-isolated-", suffix=".pkl", delete=False
+        ) as f:
+            payload = f.name
+            cloudpickle.dump(
+                (self.derivation.builder, self.realized_deps, self.tmp_output_path), f
+            )
+        try:
+            self.proc = subprocess.Popen(
+                [sys.executable, "-m", "store._isolated", payload],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            _out, err = self.proc.communicate()
+        finally:
+            Path(payload).unlink(missing_ok=True)
+        if self.aborted.is_set():
+            return
+        if self.proc.returncode != 0:
+            raise RuntimeError(
+                f"isolated build of {self.derivation.name} exited with "
+                f"{self.proc.returncode}:\n{err[-4000:]}"
+            )
+
+    def abort(self) -> None:
+        """Stop this build now (preemption / fail-fast): kill an isolated child,
+        release the lock, drop the temp output. An in-thread builder cannot be
+        interrupted; its daemon thread simply dies with the process and its
+        result is ignored."""
+        self.aborted.set()
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        if self.lock is not None:
+            self.lock.release()
+        _remove_path(self.tmp_output_path)
+
+
+class _Aborted(Exception):
+    """Internal: a build finished after it was aborted; its result is dropped."""
 
 
 class _BuildLock:
     """``<output>.lock`` with a heartbeat: tells other realizers (threads or
     processes, on the same filesystem) that this output is being built, so
     they wait for it instead of building it again. A lock whose heartbeat is
-    older than ``stale_after`` belongs to a dead build and is taken over."""
+    older than ``lock_stale_after`` belongs to a dead build and is taken over."""
 
-    def __init__(self, output_path: Path, executor: LocalExecutor):
+    def __init__(
+        self, output_path: Path, executor: LocalExecutor, aborted: threading.Event
+    ):
         self.path = output_path.with_name(output_path.name + ".lock")
         self.output_path = output_path
         self.executor = executor
+        self.aborted = aborted
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._held = False
 
     def acquire(self) -> bool:
         """Return True when we hold the lock, False when the output appeared
-        while we were waiting for someone else's build."""
-        while True:
+        while we were waiting for someone else's build (or we were aborted)."""
+        while not self.aborted.is_set():
             if self.output_path.exists():
                 return False
             try:
@@ -263,9 +344,11 @@ class _BuildLock:
                     },
                     f,
                 )
+            self._held = True
             self._thread = threading.Thread(target=self._beat, daemon=True)
             self._thread.start()
             return True
+        return False
 
     def _beat(self) -> None:
         while not self._stop.wait(self.executor.heartbeat):
@@ -275,64 +358,24 @@ class _BuildLock:
                 return
 
     def release(self) -> None:
+        if not self._held:
+            return
+        self._held = False
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
         self.path.unlink(missing_ok=True)
 
 
-def _build_derivation(
-    store_path: Path,
-    derivation: Derivation,
-    realized_deps: list[Any],
-    executor: LocalExecutor,
-) -> Path:
-    """Build one derivation whose dependencies are realized. Returns the
-    output path; skips the build when the output exists or when another
-    realizer finishes it first."""
-    output_path = store_path / _label(derivation)
-    if output_path.exists():
-        return output_path
-    store_path.mkdir(parents=True, exist_ok=True)
-    lock = _BuildLock(output_path, executor)
-    if not lock.acquire():
-        return output_path
-    # Build into a unique temporary path, then atomically rename into place, so
-    # a partially-built output is never mistaken for a complete one.
-    tmp_output_path = (
-        store_path / f"{_label(derivation)}.tmp-{os.getpid()}-{uuid4().hex}"
-    )
-    try:
-        logger.info(f"building {derivation.name}")
-        _run_builder(derivation, realized_deps, tmp_output_path)
-        if not tmp_output_path.exists():
-            file_path = inspect.getsourcefile(derivation.builder)
-            _lines, start_line = inspect.getsourcelines(derivation.builder)
-            raise Exception(
-                f"derivation {derivation.name} did not produce an output at output(). "
-                f"Perhaps make the builder at {file_path}:{start_line} "
-                "not silently fail?"
-            )
-        if (
-            output_path.exists()
-        ):  # someone else finished first (stale-lock takeover race)
-            _remove_path(tmp_output_path)
-            return output_path
-        try:
-            tmp_output_path.rename(output_path)
-        except FileExistsError:
-            _remove_path(tmp_output_path)
-    except BaseException:
-        _remove_path(tmp_output_path)
-        raise
-    finally:
-        lock.release()
-    return output_path
-
-
 class _Scheduler:
-    """One realization: the DAG under the requested roots, run in dependency
-    order with as much concurrency as the executor's pools allow."""
+    """One realization: the DAG under the requested root, run in dependency
+    order with as much concurrency as the executor's pools allow.
+
+    Builds run on daemon threads owned by this scheduler (never on the
+    calling thread), and results come back through a queue the scheduler
+    blocks on; a KeyboardInterrupt on the calling thread interrupts that
+    wait and is treated as preemption: every running build is
+    aborted (isolated children killed, locks released, temp outputs removed)
+    and the interrupt propagates. That is distinct from a build failing,
+    which only blocks that build's dependents."""
 
     def __init__(self, store_path: Path, executor: LocalExecutor, fail_fast: bool):
         self.store_path = store_path
@@ -344,8 +387,12 @@ class _Scheduler:
         self.results: dict[tuple[str, bytes], Any] = {}
         self.failed: dict[tuple[str, bytes], BaseException] = {}
         self.blocked: set[tuple[str, bytes]] = set()
+        self.running: dict[tuple[str, bytes], _Build] = {}
+        self.done_queue: queue.Queue[
+            tuple[tuple[str, bytes], Any, BaseException | None]
+        ] = queue.Queue()
 
-    def _collect(self, r: "Realizable") -> None:
+    def _collect(self, r: Realizable) -> None:
         k = _node_key(r)
         if k in self.nodes:
             return
@@ -364,115 +411,112 @@ class _Scheduler:
                 self.blocked.add(dep_k)
                 self._block(dep_k)
 
-    def run(self, roots: list["Realizable"]) -> list[Any]:
-        for r in roots:
-            self._collect(r)
-        pending = set(self.nodes)
-        running: dict[concurrent.futures.Future, tuple[str, bytes]] = {}
-        in_use: dict[str, int] = {}
-        total_slots = max(
-            1,
-            sum(
-                self.executor.capacity(n.pool)
-                for n in self.nodes.values()
-                if isinstance(n, Derivation)
-            ),
-        )
-        # Not a `with` block: on fail_fast we must raise without joining the
-        # builds still running (they finish in the background, holding their
-        # locks, and their outputs land in the store as usual).
-        pool = concurrent.futures.ThreadPoolExecutor(max_workers=total_slots)
-        try:
-            self._loop(pool, pending, running, in_use)
-        except BaseException:
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise
-        pool.shutdown(wait=True)
-        if self.failed:
-            raise RealizeError(
-                {_label(self.nodes[k]): e for k, e in self.failed.items()},
-                sorted(_label(self.nodes[b]) for b in self.blocked),
-            )
-        return [self.results[_node_key(r)] for r in roots]
-
-    def _loop(self, pool, pending, running, in_use) -> None:
-        """Submit ready derivations (within pool capacity), evaluate ready
-        expressions inline, and reap completed builds until nothing is left."""
-        while pending or running:
-            # Submit / evaluate everything whose dependencies are done.
-            progressed = True
-            while progressed:
-                progressed = False
-                for k in sorted(pending, key=lambda k: self.nodes[k].hash):
-                    if k in self.blocked:
-                        pending.discard(k)
-                        progressed = True
-                        continue
-                    if any(d not in self.results for d in self.deps[k]):
-                        continue
-                    node = self.nodes[k]
-                    realized = [self.results[d] for d in self.deps[k]]
-                    if isinstance(node, Expression):
-                        # Expressions are cheap glue: evaluate inline,
-                        # memoised for this run.
-                        pending.discard(k)
-                        try:
-                            self.results[k] = node.builder(realized)
-                        except BaseException as exc:
-                            self._fail(k, exc)
-                        progressed = True
-                        continue
-                    out = self.store_path / _label(node)
-                    if out.exists():
-                        pending.discard(k)
-                        self.results[k] = out
-                        progressed = True
-                        continue
-                    cap = self.executor.capacity(node.pool)
-                    if in_use.get(node.pool, 0) >= cap:
-                        continue
-                    in_use[node.pool] = in_use.get(node.pool, 0) + 1
-                    pending.discard(k)
-                    fut = pool.submit(
-                        _build_derivation,
-                        self.store_path,
-                        node,
-                        realized,
-                        self.executor,
-                    )
-                    running[fut] = k
-                    progressed = True
-            if not running:
-                if (
-                    pending
-                ):  # nothing runnable and nothing running: a cycle or an internal bug
-                    raise RuntimeError(
-                        f"realize: {len(pending)} node(s) can never become ready"
-                    )
-                break
-            done, _ = concurrent.futures.wait(
-                running, return_when=concurrent.futures.FIRST_COMPLETED
-            )
-            for fut in done:
-                k = running.pop(fut)
-                node = self.nodes[k]
-                in_use[node.pool] -= 1
-                try:
-                    self.results[k] = fut.result()
-                except BaseException as exc:
-                    self._fail(k, exc)
-                    if self.fail_fast:
-                        for f in running:
-                            f.cancel()
-                        raise RealizeError(
-                            {_label(node): exc},
-                            [_label(self.nodes[b]) for b in self.blocked],
-                        ) from exc
-
     def _fail(self, k: tuple[str, bytes], exc: BaseException) -> None:
         logger.error(f"failed: {_label(self.nodes[k])}: {exc!r}")
         self.failed[k] = exc
         self._block(k)
+
+    def _start(self, k: tuple[str, bytes], build: _Build) -> None:
+        def work() -> None:
+            try:
+                result = build.run()
+            except BaseException as exc:  # noqa: BLE001 - reported through the queue
+                self.done_queue.put((k, None, exc))
+            else:
+                self.done_queue.put((k, result, None))
+
+        self.running[k] = build
+        threading.Thread(
+            target=work, name=f"store-build-{build.derivation.name}", daemon=True
+        ).start()
+
+    def _abort_all(self) -> None:
+        for build in list(self.running.values()):
+            build.abort()
+        self.running.clear()
+
+    def _error(self) -> RealizeError:
+        return RealizeError(
+            {_label(self.nodes[k]): e for k, e in self.failed.items()},
+            sorted(_label(self.nodes[b]) for b in self.blocked),
+        )
+
+    def run(self, root: Realizable) -> Any:
+        self._collect(root)
+        pending = set(self.nodes)
+        in_use: dict[str, int] = {}
+        try:
+            while pending or self.running:
+                self._submit_ready(pending, in_use)
+                if not self.running:
+                    if pending:  # a cycle or an internal bug: nothing can become ready
+                        raise RuntimeError(
+                            f"realize: {len(pending)} node(s) can never become ready"
+                        )
+                    break
+                # A blocking get(): on CPython/POSIX a lock wait in the main
+                # thread is interrupted by signals, so Ctrl-C lands here at once.
+                k, result, exc = self.done_queue.get()
+                build = self.running.pop(k, None)
+                if build is None:  # finished after an abort: ignore
+                    continue
+                in_use[self.nodes[k].pool] -= 1
+                if exc is None:
+                    self.results[k] = result
+                elif isinstance(exc, _Aborted):
+                    continue
+                else:
+                    self._fail(k, exc)
+                    if self.fail_fast:
+                        self._abort_all()
+                        raise self._error()
+        except BaseException:
+            # Preemption (KeyboardInterrupt, SystemExit, ...) or fail-fast:
+            # stop everything that is running before propagating.
+            self._abort_all()
+            raise
+        if self.failed:
+            raise self._error()
+        return self.results[_node_key(root)]
+
+    def _submit_ready(self, pending: set, in_use: dict[str, int]) -> None:
+        """Start every derivation whose dependencies are done (within pool
+        capacity) and evaluate every ready expression inline."""
+        progressed = True
+        while progressed:
+            progressed = False
+            for k in sorted(pending, key=lambda k: self.nodes[k].hash):
+                if k in self.blocked:
+                    pending.discard(k)
+                    progressed = True
+                    continue
+                if any(d not in self.results for d in self.deps[k]):
+                    continue
+                node = self.nodes[k]
+                realized = [self.results[d] for d in self.deps[k]]
+                if isinstance(node, Expression):
+                    # Expressions are cheap glue: evaluate inline, memoised
+                    # for this run.
+                    pending.discard(k)
+                    try:
+                        self.results[k] = node.builder(realized)
+                    except Exception as exc:  # noqa: BLE001 - recorded as a failure
+                        self._fail(k, exc)
+                    progressed = True
+                    continue
+                out = self.store_path / _label(node)
+                if out.exists():
+                    pending.discard(k)
+                    self.results[k] = out
+                    progressed = True
+                    continue
+                cap = self.executor.capacity(node.pool)
+                if in_use.get(node.pool, 0) >= cap:
+                    continue
+                in_use[node.pool] = in_use.get(node.pool, 0) + 1
+                pending.discard(k)
+                self._start(k, _Build(self.store_path, node, realized, self.executor))
+                progressed = True
 
 
 @overload
@@ -502,8 +546,10 @@ def realize(store_path, realizable, *, executor=None, fail_fast=False):
 
     A failed derivation blocks its dependents but nothing else; when
     everything runnable has run, :class:`RealizeError` reports the failures
-    and the blocked nodes (``fail_fast=True`` raises at the first failure
-    instead).
+    and the blocked nodes. ``fail_fast=True`` aborts the running builds and
+    raises at the first failure. A KeyboardInterrupt on the calling thread is
+    preemption: running builds are aborted (isolated children killed, locks
+    released, temp outputs removed) and the interrupt propagates at once.
     """
     if not isinstance(realizable, (Derivation, Expression)):
         raise TypeError(
@@ -511,7 +557,7 @@ def realize(store_path, realizable, *, executor=None, fail_fast=False):
             f"{type(realizable).__name__}; wrap several nodes in Gather(...)"
         )
     scheduler = _Scheduler(Path(store_path), executor or LocalExecutor(), fail_fast)
-    return scheduler.run([realizable])[0]
+    return scheduler.run(realizable)
 
 
 def compute_hash(

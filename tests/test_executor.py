@@ -292,3 +292,77 @@ def test_legacy_output_alias_works_including_isolated(store_path: Path):
     assert realize(store_path, legacy()).read_text() == "legacy"
     with pytest.raises(RuntimeError, match="outside of a builder"):
         OUTPUT.get()
+
+
+_PREEMPT_SCRIPT = """
+import sys, time
+from pathlib import Path
+from store import Gather, LocalExecutor, derivation, output, realize
+
+@derivation(lambda i: f"sleepy{i}.txt", isolate=(True if "{iso}" == "iso" else False))
+def sleepy(i: int) -> None:
+    time.sleep(30)
+    output().write_text("never")
+
+print("started", flush=True)
+realize(
+    Path(sys.argv[1]),
+    Gather(*[sleepy(i) for i in range(4)]),
+    executor=LocalExecutor({{"default": 4}}),
+)
+"""
+
+
+@pytest.mark.parametrize("iso", ["thread", "iso"])
+def test_ctrl_c_preempts_promptly_and_cleans_up(
+    tmp_path: Path, store_path: Path, iso: str
+):
+    import signal
+    import subprocess
+    import sys
+
+    script = tmp_path / "preempt.py"
+    script.write_text(
+        _PREEMPT_SCRIPT.replace("{iso}", iso).replace("{{", "{").replace("}}", "}")
+    )
+    proc = subprocess.Popen(
+        [sys.executable, str(script), str(store_path)],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout.readline().strip() == "started"
+    time.sleep(1.5)  # let the four builds start and take their locks
+    assert len(list(store_path.glob("*.lock"))) == 4
+    t0 = time.time()
+    proc.send_signal(signal.SIGINT)
+    rc = proc.wait(timeout=10)
+    assert time.time() - t0 < 5.0  # not the 30 s sleeps
+    assert rc != 0
+    time.sleep(0.5)
+    assert not list(store_path.glob("*.lock")) and not list(store_path.glob("*.tmp-*"))
+    if iso == "iso":
+        # no orphaned child interpreters still writing to this store
+        assert not list(store_path.glob("*-sleepy*.txt"))
+
+
+def test_fail_fast_aborts_running_builds_and_releases_locks(store_path: Path):
+    @derivation("bad2.txt")
+    def bad() -> None:
+        time.sleep(0.2)
+        raise RuntimeError("boom")
+
+    @derivation("slow2.txt", isolate=True)
+    def slow() -> None:
+        time.sleep(30)
+        output().write_text("slow")
+
+    t0 = time.time()
+    with pytest.raises(RealizeError):
+        realize(
+            store_path,
+            Gather(bad(), slow()),
+            executor=LocalExecutor({"default": 2}),
+            fail_fast=True,
+        )
+    assert time.time() - t0 < 5.0
+    assert not list(store_path.glob("*.lock")) and not list(store_path.glob("*.tmp-*"))
