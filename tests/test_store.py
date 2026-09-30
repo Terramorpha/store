@@ -24,6 +24,7 @@ from store import (
     ExtractTarball,
     ExtractZip,
     GitClone,
+    LocalExecutor,
     LocalFile,
     LocalSymlink,
     Rename,
@@ -54,11 +55,11 @@ def test_derivation_is_built_once_and_named_by_hash(store_path: Path):
 
     d = greet("world")
     assert isinstance(d, Derivation)
-    out = realize(store_path, d)
+    out = realize(store_path, d, executor=LocalExecutor())
     assert out.parent == store_path
     assert out.name == d.hash.hex() + "-greeting.txt"
     assert out.read_text() == "hello world"
-    assert realize(store_path, greet("world")) == out
+    assert realize(store_path, greet("world"), executor=LocalExecutor()) == out
     assert calls == [1]
 
 
@@ -88,7 +89,7 @@ def test_realizable_arguments_become_dependencies_and_feed_the_hash(store_path: 
     d = length(base(3))
     assert [dep.hash for dep in d.dependencies] == [base(3).hash]
     assert length(base(3)).hash != length(base(4)).hash
-    assert realize(store_path, d).read_text() == "3"
+    assert realize(store_path, d, executor=LocalExecutor()).read_text() == "3"
     assert (store_path / (base(3).hash.hex() + "-base.txt")).exists()
 
 
@@ -98,7 +99,9 @@ def test_derivation_name_can_be_computed_from_arguments(store_path: Path):
         output().write_text(tag)
 
     assert f("abc").name == "abc.txt"
-    assert realize(store_path, f("abc")).name.endswith("-abc.txt")
+    assert realize(store_path, f("abc"), executor=LocalExecutor()).name.endswith(
+        "-abc.txt"
+    )
 
 
 def test_derivation_name_cannot_contain_a_slash():
@@ -112,7 +115,7 @@ def test_builder_that_writes_nothing_fails_loudly(store_path: Path):
         pass
 
     with pytest.raises(Exception, match="did not produce an output"):
-        realize(store_path, f())
+        realize(store_path, f(), executor=LocalExecutor())
     assert not list(store_path.iterdir())  # nothing half-built left behind as final
 
 
@@ -125,7 +128,7 @@ def test_partial_temp_output_is_not_mistaken_for_a_build(store_path: Path):
     store_path.mkdir()
     stale = store_path / f"{d.hash.hex()}-out.txt.tmp-1-deadbeef"
     stale.write_text("half")
-    out = realize(store_path, d)
+    out = realize(store_path, d, executor=LocalExecutor())
     assert out.read_text() == "ok"
     assert stale.exists()  # left for a gc to clean; never confused with the result
 
@@ -137,7 +140,7 @@ def test_builder_output_can_be_a_directory(store_path: Path):
         out.mkdir()
         (out / "a").write_text("a")
 
-    out = realize(store_path, f())
+    out = realize(store_path, f(), executor=LocalExecutor())
     assert out.is_dir() and (out / "a").read_text() == "a"
 
 
@@ -146,7 +149,7 @@ def test_output_contextvar_is_reset_after_realization(store_path: Path):
     def f() -> None:
         output().write_text("x")
 
-    realize(store_path, f())
+    realize(store_path, f(), executor=LocalExecutor())
     with pytest.raises(RuntimeError, match="outside of a builder"):
         output()
 
@@ -164,8 +167,8 @@ def test_expression_returns_a_value_and_is_not_cached(store_path: Path):
 
     e = double(21)
     assert isinstance(e, Expression)
-    assert realize(store_path, e) == 42
-    assert realize(store_path, e) == 42
+    assert realize(store_path, e, executor=LocalExecutor()) == 42
+    assert realize(store_path, e, executor=LocalExecutor()) == 42
     assert calls == [1, 1]
 
 
@@ -178,7 +181,7 @@ def test_expression_over_a_derivation(store_path: Path):
     def read(p: Path) -> int:
         return int(p.read_text())
 
-    assert realize(store_path, read(n())) == 7
+    assert realize(store_path, read(n()), executor=LocalExecutor()) == 7
 
 
 def test_child_file_and_constant(store_path: Path):
@@ -188,8 +191,13 @@ def test_child_file_and_constant(store_path: Path):
         out.mkdir()
         (out / "inner.txt").write_text("inner")
 
-    assert realize(store_path, ChildFile(d(), "inner.txt")).read_text() == "inner"
-    assert realize(store_path, Constant({"k": 1})) == {"k": 1}
+    assert (
+        realize(
+            store_path, ChildFile(d(), "inner.txt"), executor=LocalExecutor()
+        ).read_text()
+        == "inner"
+    )
+    assert realize(store_path, Constant({"k": 1}), executor=LocalExecutor()) == {"k": 1}
 
 
 # --- stock derivations ------------------------------------------------------
@@ -200,7 +208,7 @@ def test_local_file_copies_and_hashes_content(tmp_path: Path, store_path: Path):
     src.write_bytes(b"payload" * 1000)
     d = LocalFile(src)
     assert d.hash == hashlib.sha256(src.read_bytes()).digest()
-    out = realize(store_path, d)
+    out = realize(store_path, d, executor=LocalExecutor())
     assert out.read_bytes() == src.read_bytes()
     assert out.name.endswith("-src.bin")
 
@@ -208,14 +216,16 @@ def test_local_file_copies_and_hashes_content(tmp_path: Path, store_path: Path):
 def test_local_symlink_points_at_the_path(tmp_path: Path, store_path: Path):
     target = tmp_path / "target"
     target.write_text("t")
-    out = realize(store_path, LocalSymlink("link", target))
+    out = realize(store_path, LocalSymlink("link", target), executor=LocalExecutor())
     assert out.is_symlink() and out.resolve() == target.resolve()
 
 
 def test_symlink_points_at_its_input_not_itself(tmp_path: Path, store_path: Path):
     src = tmp_path / "f.txt"
     src.write_text("f")
-    out = realize(store_path, Symlink("f-link", LocalFile(src)))
+    out = realize(
+        store_path, Symlink("f-link", LocalFile(src)), executor=LocalExecutor()
+    )
     assert out.is_symlink()
     assert out.resolve() != out and out.read_text() == "f"
 
@@ -223,7 +233,12 @@ def test_symlink_points_at_its_input_not_itself(tmp_path: Path, store_path: Path
 def test_rename_copies_files_and_directories(tmp_path: Path, store_path: Path):
     src = tmp_path / "orig.txt"
     src.write_text("o")
-    assert realize(store_path, Rename("renamed.txt", LocalFile(src))).read_text() == "o"
+    assert (
+        realize(
+            store_path, Rename("renamed.txt", LocalFile(src)), executor=LocalExecutor()
+        ).read_text()
+        == "o"
+    )
 
     @derivation("d")
     def d() -> None:
@@ -231,7 +246,7 @@ def test_rename_copies_files_and_directories(tmp_path: Path, store_path: Path):
         out.mkdir()
         (out / "x").write_text("x")
 
-    out = realize(store_path, Rename("copy", d()))
+    out = realize(store_path, Rename("copy", d()), executor=LocalExecutor())
     assert out.name.endswith("-copy") and (out / "x").read_text() == "x"
 
 
@@ -247,12 +262,12 @@ def test_extract_zip_and_extract_from_zip(tmp_path: Path, store_path: Path):
     archive = tmp_path / "bundle.zip"
     archive.write_bytes(_zip_bytes({"a.txt": b"A", "sub/b.txt": b"B"}))
     z = LocalFile(archive)
-    out = realize(store_path, ExtractZip(z))
+    out = realize(store_path, ExtractZip(z), executor=LocalExecutor())
     assert out.name.endswith("-bundle")
     assert (out / "a.txt").read_bytes() == b"A" and (
         out / "sub" / "b.txt"
     ).read_bytes() == b"B"
-    one = realize(store_path, ExtractFromZip(z, "sub/b.txt"))
+    one = realize(store_path, ExtractFromZip(z, "sub/b.txt"), executor=LocalExecutor())
     assert one.name.endswith("-b.txt") and one.read_bytes() == b"B"
     assert ExtractFromZip(z, "a.txt").hash != ExtractFromZip(z, "sub/b.txt").hash
 
@@ -264,7 +279,9 @@ def test_extract_tarball(tmp_path: Path, store_path: Path):
     archive = tmp_path / "content.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
         tar.add(src / "c.txt", arcname="c.txt")
-    out = realize(store_path, ExtractTarball(LocalFile(archive)))
+    out = realize(
+        store_path, ExtractTarball(LocalFile(archive)), executor=LocalExecutor()
+    )
     assert out.name.endswith("-content") and (out / "c.txt").read_text() == "C"
 
 
@@ -288,13 +305,16 @@ def test_download_file_verifies_hash(monkeypatch, store_path: Path):
     )
     good = hashlib.sha256(data).digest()
     out = realize(
-        store_path, DownloadFile("blob.bin", "https://example.invalid/blob", good)
+        store_path,
+        DownloadFile("blob.bin", "https://example.invalid/blob", good),
+        executor=LocalExecutor(),
     )
     assert out.read_bytes() == data
     with pytest.raises(Exception, match="Hash of download"):
         realize(
             store_path,
             DownloadFile("blob2.bin", "https://example.invalid/blob2", b"\x00" * 32),
+            executor=LocalExecutor(),
         )
     assert not any(p.name.endswith("-blob2.bin") for p in store_path.iterdir())
 
@@ -305,7 +325,7 @@ def test_download_file_without_hash_is_addressed_by_url(monkeypatch, store_path:
     )
     d = DownloadFile("f", "https://example.invalid/f", None)
     assert d.hash == hashlib.sha256(b"https://example.invalid/f").digest()
-    assert realize(store_path, d).read_bytes() == b"x"
+    assert realize(store_path, d, executor=LocalExecutor()).read_bytes() == b"x"
 
 
 def test_git_clone_checks_out_commit_and_verifies_tree_hash(
@@ -327,12 +347,20 @@ def test_git_clone_checks_out_commit_and_verifies_tree_hash(
     hash_directory_tree(hasher, expected_tree)
     expected = hasher.digest()
 
-    out = realize(store_path, GitClone("repo", str(src), c1.hexsha, expected))
+    out = realize(
+        store_path,
+        GitClone("repo", str(src), c1.hexsha, expected),
+        executor=LocalExecutor(),
+    )
     assert (out / "README").read_text() == "v1"
     assert not (out / ".git").exists()
 
     with pytest.raises(Exception, match="Hash of git repo"):
-        realize(store_path, GitClone("repo-bad", str(src), c1.hexsha, b"\x01" * 32))
+        realize(
+            store_path,
+            GitClone("repo-bad", str(src), c1.hexsha, b"\x01" * 32),
+            executor=LocalExecutor(),
+        )
     assert not any(
         "clone-" in p.name for p in store_path.iterdir()
     )  # temp clone removed

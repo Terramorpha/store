@@ -20,7 +20,7 @@ its outputs.
 
 ```python
 from pathlib import Path
-from store import DownloadFile, derivation, output, realize
+from store import DownloadFile, LocalExecutor, derivation, output, realize
 
 archive = DownloadFile("data.tar.gz", "https://example.org/data.tar.gz", hash=None)
 
@@ -32,7 +32,11 @@ def summarize(archive: Path, threshold: float) -> None:
     out.write_text("...")
 
 
-path = realize(Path("~/.cache/mystore").expanduser(), summarize(archive, threshold=0.5))
+path = realize(
+    Path("~/.cache/mystore").expanduser(),
+    summarize(archive, threshold=0.5),
+    executor=LocalExecutor(),   # serial; always given explicitly
+)
 ```
 
 Hashes are **input-addressed**: they name the recipe (function, arguments,
@@ -45,7 +49,8 @@ Included concrete derivations: `DownloadFile`, `GitClone`, `LocalFile`,
 
 ## Parallel realization
 
-`realize` takes one node and an executor. The DAG under the node is scheduled
+`realize` takes one node and an executor (always explicit; `LocalExecutor()`
+is the serial one). The DAG under the node is scheduled
 in dependency order; its independent parts run concurrently within the slot
 budget of their **pool**. Parallelism is therefore automatic: a derivation
 whose inputs do not depend on each other gets them built side by side. To
@@ -69,7 +74,7 @@ evals = realize(store, Gather(*[evaluate(train(cfg, s)) for s in range(3)]), exe
 ```
 
 * `pool`: the executor pool whose slot the build occupies (unlisted pools get
-  `default_pool_size`). The default `LocalExecutor()` is serial.
+  `default_pool_size`). `LocalExecutor()` with no arguments is serial.
 * `isolate=True`: the builder runs in a fresh interpreter (the closure and its
   realized inputs travel by cloudpickle), for crash isolation and for
   libraries that must not share process state.

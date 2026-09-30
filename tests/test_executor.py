@@ -51,7 +51,11 @@ def test_independent_derivations_run_concurrently(store_path: Path):
 def test_serial_default_executor(store_path: Path):
     f = _sleeper()
     t0 = time.time()
-    realize(store_path, Gather(*[f(f"s{i}", 0.2) for i in range(3)]))
+    realize(
+        store_path,
+        Gather(*[f(f"s{i}", 0.2) for i in range(3)]),
+        executor=LocalExecutor(),
+    )
     assert time.time() - t0 >= 0.6
 
 
@@ -181,7 +185,7 @@ def test_expression_is_evaluated_once_per_realization(store_path: Path):
 
 def test_isolated_builder_runs_in_another_interpreter(store_path: Path):
     f = _sleeper(isolate=True)
-    out = realize(store_path, f("iso", 0.0))
+    out = realize(store_path, f("iso", 0.0), executor=LocalExecutor())
     tag, pid = out.read_text().split()
     assert tag == "iso" and int(pid) != os.getpid()
 
@@ -192,7 +196,7 @@ def test_isolated_builder_failure_is_reported(store_path: Path):
         raise ValueError("child boom")
 
     with pytest.raises(RealizeError) as ei:
-        realize(store_path, bad())
+        realize(store_path, bad(), executor=LocalExecutor())
     (exc,) = ei.value.failed.values()
     assert "child boom" in str(exc)
 
@@ -243,7 +247,9 @@ def test_nested_realize_inside_a_builder(store_path: Path):
 
     @derivation("outer.txt")
     def outer() -> None:
-        p = realize(store_path, inner())  # builders may realize on their own
+        p = realize(
+            store_path, inner(), executor=LocalExecutor()
+        )  # builders may realize on their own
         output().write_text(p.read_text() + "+outer")
 
     assert (
@@ -257,10 +263,12 @@ def test_gather_returns_values_in_order_and_lists_are_rejected(store_path: Path)
     def x() -> None:
         output().write_text("x")
 
-    res = realize(store_path, Gather(Constant(1), x(), Constant("c")))
+    res = realize(
+        store_path, Gather(Constant(1), x(), Constant("c")), executor=LocalExecutor()
+    )
     assert res[0] == 1 and res[1].read_text() == "x" and res[2] == "c"
     with pytest.raises(TypeError, match="Gather"):
-        realize(store_path, [x()])  # type: ignore[arg-type]
+        realize(store_path, [x()], executor=LocalExecutor())  # type: ignore[arg-type]
 
 
 def test_single_root_builds_independent_dependencies_in_parallel(store_path: Path):
@@ -289,7 +297,9 @@ def test_legacy_output_alias_works_including_isolated(store_path: Path):
     def legacy() -> None:
         OUTPUT.get().write_text("legacy")
 
-    assert realize(store_path, legacy()).read_text() == "legacy"
+    assert (
+        realize(store_path, legacy(), executor=LocalExecutor()).read_text() == "legacy"
+    )
     with pytest.raises(RuntimeError, match="outside of a builder"):
         OUTPUT.get()
 

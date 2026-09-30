@@ -121,9 +121,8 @@ class RealizeError(Exception):
 class LocalExecutor:
     """Runs builders on this machine, concurrently, with a slot budget per
     pool. ``pools`` maps a pool name to how many of its builds may run at
-    once; a pool not listed gets ``default_pool_size`` slots. The serial
-    behaviour of the original store is ``LocalExecutor()`` (one slot per pool,
-    and a single root has nothing to run in parallel with anyway).
+    once; a pool not listed gets ``default_pool_size`` slots. ``LocalExecutor()``
+    with no arguments is the serial executor (one slot per pool).
 
     Builds run on daemon worker threads. A builder that spends its time in a
     subprocess (EnergyPlus, a training script) releases the GIL, so threads
@@ -524,7 +523,7 @@ def realize(
     store_path: Path,
     expression: Expression[Result],
     *,
-    executor: LocalExecutor | None = None,
+    executor: LocalExecutor,
     fail_fast: bool = False,
 ) -> Result: ...
 @overload
@@ -532,17 +531,18 @@ def realize(
     store_path: Path,
     derivation: Derivation,
     *,
-    executor: LocalExecutor | None = None,
+    executor: LocalExecutor,
     fail_fast: bool = False,
 ) -> Path: ...
-def realize(store_path, realizable, *, executor=None, fail_fast=False):
+def realize(store_path, realizable, *, executor, fail_fast=False):
     """Realize one node: a derivation (returns its Path) or an expression
     (returns its value), building whatever is missing under it.
 
-    The DAG under the node is scheduled in dependency order; with an
-    ``executor`` whose pools have more than one slot, independent
-    dependencies are built concurrently. To build several unrelated nodes
-    together, make them the dependencies of one node, e.g. ``Gather(a, b, c)``.
+    ``executor`` says how builds run and is always given explicitly:
+    ``LocalExecutor()`` is serial, ``LocalExecutor({"pool": n, ...})`` runs
+    independent dependencies concurrently within each pool's slot budget. To
+    build several unrelated nodes together, make them the dependencies of one
+    node, e.g. ``Gather(a, b, c)``.
 
     A failed derivation blocks its dependents but nothing else; when
     everything runnable has run, :class:`RealizeError` reports the failures
@@ -556,7 +556,11 @@ def realize(store_path, realizable, *, executor=None, fail_fast=False):
             "realize() takes a Derivation or an Expression, not "
             f"{type(realizable).__name__}; wrap several nodes in Gather(...)"
         )
-    scheduler = _Scheduler(Path(store_path), executor or LocalExecutor(), fail_fast)
+    if not isinstance(executor, LocalExecutor):
+        raise TypeError(
+            f"executor must be a LocalExecutor, not {type(executor).__name__}"
+        )
+    scheduler = _Scheduler(Path(store_path), executor, fail_fast)
     return scheduler.run(realizable)
 
 
