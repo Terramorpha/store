@@ -12,6 +12,7 @@ import pytest
 
 from store import (
     Constant,
+    Gather,
     LocalExecutor,
     RealizeError,
     derivation,
@@ -40,7 +41,7 @@ def test_independent_derivations_run_concurrently(store_path: Path):
     t0 = time.time()
     outs = realize(
         store_path,
-        [f(f"a{i}", 0.4) for i in range(4)],
+        Gather(*[f(f"a{i}", 0.4) for i in range(4)]),
         executor=LocalExecutor({"default": 4}),
     )
     assert time.time() - t0 < 1.2  # 4 x 0.4 s serial would be 1.6 s
@@ -50,7 +51,7 @@ def test_independent_derivations_run_concurrently(store_path: Path):
 def test_serial_default_executor(store_path: Path):
     f = _sleeper()
     t0 = time.time()
-    realize(store_path, [f(f"s{i}", 0.2) for i in range(3)])
+    realize(store_path, Gather(*[f(f"s{i}", 0.2) for i in range(3)]))
     assert time.time() - t0 >= 0.6
 
 
@@ -74,7 +75,7 @@ def test_pool_capacity_is_respected(store_path: Path):
 
     tr, ev = make("train"), make("eval")
     nodes = [tr(f"t{i}") for i in range(6)] + [ev(f"e{i}") for i in range(3)]
-    realize(store_path, nodes, executor=LocalExecutor({"train": 2, "eval": 1}))
+    realize(store_path, Gather(*nodes), executor=LocalExecutor({"train": 2, "eval": 1}))
     assert peak == {"train": 2, "eval": 1}
 
 
@@ -97,7 +98,9 @@ def test_dependencies_run_before_dependents_and_share_results(store_path: Path):
 
     b = base()
     outs = realize(
-        store_path, [child(b, 1), child(b, 2)], executor=LocalExecutor({"default": 4})
+        store_path,
+        Gather(child(b, 1), child(b, 2)),
+        executor=LocalExecutor({"default": 4}),
     )
     assert order[0] == "base" and set(order[1:]) == {"child1", "child2"}
     assert [o.read_text() for o in outs] == ["3", "6"]
@@ -120,13 +123,15 @@ def test_failure_blocks_dependents_but_not_independent_work(store_path: Path):
     with pytest.raises(RealizeError) as ei:
         realize(
             store_path,
-            [after_bad(bad()), good()],
+            Gather(after_bad(bad()), good()),
             executor=LocalExecutor({"default": 2}),
         )
     err = ei.value
     assert list(err.failed) == [bad().hash.hex() + "-bad.txt"]
     assert isinstance(err.failed[bad().hash.hex() + "-bad.txt"], ValueError)
-    assert err.blocked == [after_bad(bad()).hash.hex() + "-after_bad.txt"]
+    # blocked: the dependent that lost its input, and the Gather root itself
+    assert after_bad(bad()).hash.hex() + "-after_bad.txt" in err.blocked
+    assert len(err.blocked) == 2 and any(b.startswith("expr-") for b in err.blocked)
     assert (store_path / (good().hash.hex() + "-good.txt")).read_text() == "ok"
     assert not list(store_path.glob("*.tmp-*")) and not list(store_path.glob("*.lock"))
 
@@ -145,7 +150,7 @@ def test_fail_fast_raises_immediately(store_path: Path):
     with pytest.raises(RealizeError):
         realize(
             store_path,
-            [bad(), slow()],
+            Gather(bad(), slow()),
             executor=LocalExecutor({"default": 2}),
             fail_fast=True,
         )
@@ -166,7 +171,9 @@ def test_expression_is_evaluated_once_per_realization(store_path: Path):
 
     e = shared()
     outs = realize(
-        store_path, [use(e, 1), use(e, 2), e], executor=LocalExecutor({"default": 2})
+        store_path,
+        Gather(use(e, 1), use(e, 2), e),
+        executor=LocalExecutor({"default": 2}),
     )
     assert calls == [1]
     assert [outs[0].read_text(), outs[1].read_text(), outs[2]] == ["5", "10", 5]
@@ -245,13 +252,34 @@ def test_nested_realize_inside_a_builder(store_path: Path):
     )
 
 
-def test_list_of_roots_returns_values_in_order(store_path: Path):
+def test_gather_returns_values_in_order_and_lists_are_rejected(store_path: Path):
     @derivation("x.txt")
     def x() -> None:
         output().write_text("x")
 
-    res = realize(store_path, [Constant(1), x(), Constant("c")])
+    res = realize(store_path, Gather(Constant(1), x(), Constant("c")))
     assert res[0] == 1 and res[1].read_text() == "x" and res[2] == "c"
+    with pytest.raises(TypeError, match="Gather"):
+        realize(store_path, [x()])  # type: ignore[arg-type]
+
+
+def test_single_root_builds_independent_dependencies_in_parallel(store_path: Path):
+    """The type-true entry point: one derivation whose dependencies are
+    independent gets them built concurrently, no list API needed."""
+    f = _sleeper()
+
+    @derivation("sum.txt")
+    def total(*parts: Path) -> None:
+        output().write_text("+".join(p.read_text().split()[0] for p in parts))
+
+    t0 = time.time()
+    out = realize(
+        store_path,
+        total(*[f(f"p{i}", 0.4) for i in range(4)]),
+        executor=LocalExecutor({"default": 4}),
+    )
+    assert time.time() - t0 < 1.2
+    assert out.read_text() == "p0+p1+p2+p3"
 
 
 def test_legacy_output_alias_works_including_isolated(store_path: Path):

@@ -41,13 +41,16 @@ builders (training runs, simulations) are fine.
 
 Included concrete derivations: `DownloadFile`, `GitClone`, `LocalFile`,
 `LocalSymlink`, `Symlink`, `Rename`, `ExtractTarball`, `ExtractZip`,
-`ExtractFromZip`, and the expressions `ChildFile`, `Constant`.
+`ExtractFromZip`, and the expressions `ChildFile`, `Constant`, `Gather`.
 
 ## Parallel realization
 
-`realize` accepts a list of roots and an executor. The DAG under the roots is
-scheduled in dependency order; independent builds run concurrently within the
-slot budget of their **pool**:
+`realize` takes one node and an executor. The DAG under the node is scheduled
+in dependency order; its independent parts run concurrently within the slot
+budget of their **pool**. Parallelism is therefore automatic: a derivation
+whose inputs do not depend on each other gets them built side by side. To
+build several unrelated nodes together, make them the inputs of one node,
+e.g. `Gather(a, b, c)` (an expression returning their values as a list):
 
 ```python
 from store import LocalExecutor, derivation, realize
@@ -62,7 +65,7 @@ def evaluate(checkpoint: Path) -> None: ...
 
 
 ex = LocalExecutor({"train": 3, "eval": 1}, default_pool_size=8)
-evals = realize(store, [evaluate(train(cfg, s)) for s in range(3)], executor=ex)
+evals = realize(store, Gather(*[evaluate(train(cfg, s)) for s in range(3)]), executor=ex)
 ```
 
 * `pool`: the executor pool whose slot the build occupies (unlisted pools get

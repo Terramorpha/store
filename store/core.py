@@ -491,30 +491,27 @@ def realize(
     executor: LocalExecutor | None = None,
     fail_fast: bool = False,
 ) -> Path: ...
-@overload
-def realize(
-    store_path: Path,
-    realizables: list["Realizable"],
-    *,
-    executor: LocalExecutor | None = None,
-    fail_fast: bool = False,
-) -> list[Any]: ...
 def realize(store_path, realizable, *, executor=None, fail_fast=False):
-    """Realize one node (returns its Path / value) or a list of nodes
-    (returns the list of their Paths / values), building whatever is missing.
+    """Realize one node: a derivation (returns its Path) or an expression
+    (returns its value), building whatever is missing under it.
 
-    The DAG under the roots is scheduled by dependency order; with an
-    ``executor`` whose pools have more than one slot, independent builds run
-    concurrently. A failed derivation blocks its dependents but nothing else;
-    when everything runnable has run, :class:`RealizeError` reports the
-    failures and the blocked nodes (``fail_fast=True`` raises at the first
-    failure instead).
+    The DAG under the node is scheduled in dependency order; with an
+    ``executor`` whose pools have more than one slot, independent
+    dependencies are built concurrently. To build several unrelated nodes
+    together, make them the dependencies of one node, e.g. ``Gather(a, b, c)``.
+
+    A failed derivation blocks its dependents but nothing else; when
+    everything runnable has run, :class:`RealizeError` reports the failures
+    and the blocked nodes (``fail_fast=True`` raises at the first failure
+    instead).
     """
-    store_path = Path(store_path)
-    single = isinstance(realizable, (Derivation, Expression))
-    roots = [realizable] if single else list(realizable)
-    results = _Scheduler(store_path, executor or LocalExecutor(), fail_fast).run(roots)
-    return results[0] if single else results
+    if not isinstance(realizable, (Derivation, Expression)):
+        raise TypeError(
+            "realize() takes a Derivation or an Expression, not "
+            f"{type(realizable).__name__}; wrap several nodes in Gather(...)"
+        )
+    scheduler = _Scheduler(Path(store_path), executor or LocalExecutor(), fail_fast)
+    return scheduler.run([realizable])[0]
 
 
 def compute_hash(
@@ -925,3 +922,11 @@ def ChildFile(parent: Path, child: str) -> Path:
 @expression()
 def Constant(x):
     return x
+
+
+@expression()
+def Gather(*nodes: Any) -> list[Any]:
+    """The realized values of ``nodes`` as a list, in order. Its only job is
+    to make several unrelated nodes the dependencies of one node, so that a
+    single ``realize`` builds them all, concurrently when the executor allows."""
+    return list(nodes)
