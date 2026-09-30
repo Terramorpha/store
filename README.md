@@ -41,6 +41,39 @@ Included concrete derivations: `DownloadFile`, `GitClone`, `LocalFile`,
 `LocalSymlink`, `Symlink`, `Rename`, `ExtractTarball`, `ExtractZip`,
 `ExtractFromZip`, and the expressions `ChildFile`, `Constant`.
 
+## Parallel realization
+
+`realize` accepts a list of roots and an executor. The DAG under the roots is
+scheduled in dependency order; independent builds run concurrently within the
+slot budget of their **pool**:
+
+```python
+from store import LocalExecutor, derivation, realize
+
+@derivation("checkpoint", pool="train", isolate=True)
+def train(config: dict, seed: int) -> None: ...
+
+@derivation("eval.csv", pool="eval")
+def evaluate(checkpoint: Path) -> None: ...
+
+ex = LocalExecutor({"train": 3, "eval": 1}, default_pool_size=8)
+evals = realize(store, [evaluate(train(cfg, s)) for s in range(3)], executor=ex)
+```
+
+* `pool`: the executor pool whose slot the build occupies (unlisted pools get
+  `default_pool_size`). The default `LocalExecutor()` is serial.
+* `isolate=True`: the builder runs in a fresh interpreter (the closure and its
+  realized inputs travel by cloudpickle), for crash isolation and for
+  libraries that must not share process state.
+* Failures: a failed derivation blocks its dependents and nothing else; when
+  everything runnable has run, `RealizeError` lists the failed and blocked
+  nodes. `fail_fast=True` raises at the first failure without waiting for the
+  builds still running.
+* Build locks: a `<output>.lock` file with a heartbeat marks an output being
+  built, so another realizer (thread, process, or a driver restarted after a
+  crash) waits for it instead of building it again; a lock whose heartbeat is
+  older than `lock_stale_after` is taken over.
+
 ## Development
 
 ```

@@ -5,17 +5,25 @@ See the package README for the model. Everything public is re-exported from
 ``store``.
 """
 
+import concurrent.futures
+import copyreg
 import hashlib
 import inspect
+import json
 import logging
 import os
 import pickle
 import shutil
+import socket
+import subprocess
+import sys
 import tarfile
 import tempfile
+import threading
+import time
 import zipfile
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Generic, TypeVar, Union, overload
@@ -32,13 +40,34 @@ logger = logging.getLogger(__name__)
 OUTPUT: ContextVar[Path] = ContextVar("OUTPUT")
 
 
+def _contextvar_by_name(name: str) -> ContextVar:
+    if name == "OUTPUT":
+        return OUTPUT
+    raise ValueError(f"cannot unpickle ContextVar {name!r}")
+
+
+# A builder closure usually references OUTPUT; when cloudpickle ships such a
+# closure to an isolated child it serialises the closure's globals by value,
+# and a ContextVar is not picklable. Pickle it by NAME instead: the child
+# resolves it to its own store.core.OUTPUT.
+copyreg.pickle(type(OUTPUT), lambda v: (_contextvar_by_name, (v.name,)))
+
+
+DEFAULT_POOL = "default"
+
+
 @dataclass(frozen=True)
 class Derivation:
     name: str
     hash: bytes
     dependencies: list["Realizable"]
-    # Builder now receives only realized dependencies; output path is read from the ContextVar
+    # Builder receives only the realized dependencies; the output path is read
+    # from the OUTPUT ContextVar.
     builder: Callable[[list[Any]], None]
+    # Scheduling: which executor pool this build occupies a slot of, and whether
+    # the builder must run in a fresh interpreter (crash / global-state isolation).
+    pool: str = DEFAULT_POOL
+    isolate: bool = False
 
     def __post_init__(self):
         assert (
@@ -59,85 +88,416 @@ class Expression(Generic[Result]):
 Realizable = Union[Derivation, Expression]
 
 
-@overload
-def realize(store_path: Path, expression: Expression[Result]) -> Result: ...
-@overload
-def realize(store_path: Path, derivation: Derivation) -> Path: ...
-def realize(store_path: Path, realizable: Realizable) -> Path | Result:
-    """Realize a derivation (returns Path) or expression (returns value)."""
+class RealizeError(Exception):
+    """Raised at the end of a realization in which at least one derivation
+    failed. ``failed`` maps the node's ``<hash>-<name>`` to the exception;
+    ``blocked`` lists the nodes that could not run because a dependency
+    failed. Everything independent of the failures was still built."""
 
-    def inner(realizable: Realizable):
-        if isinstance(realizable, Derivation):
-            # Check if already built
-            output_path = store_path / (realizable.hash.hex() + "-" + realizable.name)
-            if output_path.exists():
-                return output_path
+    def __init__(self, failed: dict[str, BaseException], blocked: list[str]):
+        self.failed = failed
+        self.blocked = blocked
+        lines = [f"{len(failed)} derivation(s) failed, {len(blocked)} blocked"]
+        for key, exc in failed.items():
+            lines.append(f"  FAILED  {key}: {type(exc).__name__}: {exc}")
+        for key in blocked:
+            lines.append(f"  BLOCKED {key}")
+        super().__init__("\n".join(lines))
 
-            # Build into a unique temporary path, then atomically rename into place.
-            # This prevents:
-            # - partially-built outputs from being treated as complete
-            # - concurrent processes from clobbering the same output directory/files
-            tmp_output_path = store_path / (
-                f"{realizable.hash.hex()}-{realizable.name}.tmp-{os.getpid()}-{uuid4().hex}"
-            )
 
-            # Realize dependencies
-            realized_deps = [inner(dep) for dep in realizable.dependencies]
+class LocalExecutor:
+    """Runs builders on this machine, concurrently, with a slot budget per
+    pool. ``pools`` maps a pool name to how many of its builds may run at
+    once; a pool not listed gets ``default_pool_size`` slots. The serial
+    behaviour of the original store is ``LocalExecutor()`` (one slot per pool,
+    and a single root has nothing to run in parallel with anyway).
 
-            # Build with ContextVar carrying the temp output path
-            tmp_output_path.parent.mkdir(parents=True, exist_ok=True)
-            token_output = OUTPUT.set(tmp_output_path)
-            try:
-                logger.info(f"building {realizable.name}")
-                realizable.builder(realized_deps)
+    Builds run on worker threads. A builder that spends its time in a
+    subprocess (EnergyPlus, a training script) releases the GIL, so threads
+    are enough; a builder that must not share interpreter state, or that does
+    heavy in-process Python work, is declared ``isolate=True`` on its
+    derivation and is run in a fresh interpreter (see ``_run_isolated``).
 
-                if not tmp_output_path.exists():
-                    file_path = inspect.getsourcefile(realizable.builder)
-                    source_lines, start_line = inspect.getsourcelines(
-                        realizable.builder
-                    )
+    ``lock_stale_after`` (seconds) is how old a build lock's heartbeat may be
+    before the build behind it is presumed dead and the lock is taken over.
+    """
 
-                    raise Exception(
-                        f"derivation {realizable.name} did not produce an output at OUTPUT.get(). Perhaps make the builder at {file_path}:{start_line} not silently fail?"
-                    )
-                # If another process finished first, keep the existing output and
-                # clean up our temp output.
-                if output_path.exists():
-                    try:
-                        if tmp_output_path.is_dir():
-                            shutil.rmtree(tmp_output_path, ignore_errors=True)
-                        else:
-                            tmp_output_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    return output_path
+    def __init__(
+        self,
+        pools: dict[str, int] | None = None,
+        *,
+        default_pool_size: int = 1,
+        lock_stale_after: float = 300.0,
+        heartbeat: float = 30.0,
+        poll: float = 1.0,
+    ):
+        self.pools = dict(pools or {})
+        self.default_pool_size = default_pool_size
+        self.lock_stale_after = lock_stale_after
+        self.heartbeat = heartbeat
+        self.poll = poll
 
-                try:
-                    tmp_output_path.rename(output_path)
-                except FileExistsError:
-                    # Race: another process created it between our check and rename.
-                    try:
-                        if tmp_output_path.is_dir():
-                            shutil.rmtree(tmp_output_path, ignore_errors=True)
-                        else:
-                            tmp_output_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                    return output_path
-            finally:
-                OUTPUT.reset(token_output)
-            return output_path
+    def capacity(self, pool: str) -> int:
+        return self.pools.get(pool, self.default_pool_size)
 
-        elif isinstance(realizable, Expression):
-            # Realize dependencies and evaluate (no caching)
-            realized_deps = [inner(dep) for dep in realizable.dependencies]
-            result = realizable.builder(realized_deps)
-            return result
 
+def _node_key(r: "Realizable") -> tuple[str, bytes]:
+    return (type(r).__name__, r.hash)
+
+
+def _label(r: "Realizable") -> str:
+    if isinstance(r, Derivation):
+        return r.hash.hex() + "-" + r.name
+    return "expr-" + r.hash.hex()
+
+
+def _remove_path(p: Path) -> None:
+    try:
+        if p.is_dir() and not p.is_symlink():
+            shutil.rmtree(p, ignore_errors=True)
         else:
-            raise ValueError(f"Unknown realizable type: {type(realizable)}")
+            p.unlink(missing_ok=True)
+    except Exception:
+        pass
 
-    return inner(realizable)
+
+def _run_builder(
+    derivation: Derivation, realized_deps: list[Any], tmp_output_path: Path
+) -> None:
+    """Call the builder with OUTPUT bound to ``tmp_output_path``, in this
+    thread or (``isolate``) in a fresh interpreter."""
+    if derivation.isolate:
+        _run_isolated(derivation, realized_deps, tmp_output_path)
+        return
+    token = OUTPUT.set(tmp_output_path)
+    try:
+        derivation.builder(realized_deps)
+    finally:
+        OUTPUT.reset(token)
+
+
+def _run_isolated(
+    derivation: Derivation, realized_deps: list[Any], tmp_output_path: Path
+) -> None:
+    """Run the builder in a child interpreter: the builder closure, its
+    realized dependencies and the output path are cloudpickled to a file,
+    ``python -m store._isolated <file>`` loads them, binds OUTPUT and calls
+    the builder. The child inherits this process's environment and cwd."""
+    import cloudpickle
+
+    with tempfile.NamedTemporaryFile(
+        "wb", prefix="store-isolated-", suffix=".pkl", delete=False
+    ) as f:
+        payload = f.name
+        cloudpickle.dump((derivation.builder, realized_deps, tmp_output_path), f)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "store._isolated", payload],
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        Path(payload).unlink(missing_ok=True)
+    if proc.returncode != 0:
+        tail = proc.stderr[-4000:]
+        raise RuntimeError(
+            f"isolated build of {derivation.name} exited with {proc.returncode}:\n{tail}"
+        )
+
+
+class _BuildLock:
+    """``<output>.lock`` with a heartbeat: tells other realizers (threads or
+    processes, on the same filesystem) that this output is being built, so
+    they wait for it instead of building it again. A lock whose heartbeat is
+    older than ``stale_after`` belongs to a dead build and is taken over."""
+
+    def __init__(self, output_path: Path, executor: LocalExecutor):
+        self.path = output_path.with_name(output_path.name + ".lock")
+        self.output_path = output_path
+        self.executor = executor
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def acquire(self) -> bool:
+        """Return True when we hold the lock, False when the output appeared
+        while we were waiting for someone else's build."""
+        while True:
+            if self.output_path.exists():
+                return False
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    age = time.time() - self.path.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                if age > self.executor.lock_stale_after:
+                    logger.warning(
+                        f"taking over stale lock {self.path.name} (heartbeat {age:.0f}s old)"
+                    )
+                    self.path.unlink(missing_ok=True)
+                    continue
+                time.sleep(self.executor.poll)
+                continue
+            with os.fdopen(fd, "w") as f:
+                json.dump(
+                    {
+                        "pid": os.getpid(),
+                        "host": socket.gethostname(),
+                        "started": time.time(),
+                    },
+                    f,
+                )
+            self._thread = threading.Thread(target=self._beat, daemon=True)
+            self._thread.start()
+            return True
+
+    def _beat(self) -> None:
+        while not self._stop.wait(self.executor.heartbeat):
+            try:
+                os.utime(self.path, None)
+            except FileNotFoundError:
+                return
+
+    def release(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self.path.unlink(missing_ok=True)
+
+
+def _build_derivation(
+    store_path: Path,
+    derivation: Derivation,
+    realized_deps: list[Any],
+    executor: LocalExecutor,
+) -> Path:
+    """Build one derivation whose dependencies are realized. Returns the
+    output path; skips the build when the output exists or when another
+    realizer finishes it first."""
+    output_path = store_path / _label(derivation)
+    if output_path.exists():
+        return output_path
+    store_path.mkdir(parents=True, exist_ok=True)
+    lock = _BuildLock(output_path, executor)
+    if not lock.acquire():
+        return output_path
+    # Build into a unique temporary path, then atomically rename into place, so
+    # a partially-built output is never mistaken for a complete one.
+    tmp_output_path = (
+        store_path / f"{_label(derivation)}.tmp-{os.getpid()}-{uuid4().hex}"
+    )
+    try:
+        logger.info(f"building {derivation.name}")
+        _run_builder(derivation, realized_deps, tmp_output_path)
+        if not tmp_output_path.exists():
+            file_path = inspect.getsourcefile(derivation.builder)
+            _lines, start_line = inspect.getsourcelines(derivation.builder)
+            raise Exception(
+                f"derivation {derivation.name} did not produce an output at OUTPUT.get(). "
+                f"Perhaps make the builder at {file_path}:{start_line} not silently fail?"
+            )
+        if (
+            output_path.exists()
+        ):  # someone else finished first (stale-lock takeover race)
+            _remove_path(tmp_output_path)
+            return output_path
+        try:
+            tmp_output_path.rename(output_path)
+        except FileExistsError:
+            _remove_path(tmp_output_path)
+    except BaseException:
+        _remove_path(tmp_output_path)
+        raise
+    finally:
+        lock.release()
+    return output_path
+
+
+class _Scheduler:
+    """One realization: the DAG under the requested roots, run in dependency
+    order with as much concurrency as the executor's pools allow."""
+
+    def __init__(self, store_path: Path, executor: LocalExecutor, fail_fast: bool):
+        self.store_path = store_path
+        self.executor = executor
+        self.fail_fast = fail_fast
+        self.nodes: dict[tuple[str, bytes], "Realizable"] = {}
+        self.deps: dict[tuple[str, bytes], list[tuple[str, bytes]]] = {}
+        self.dependents: dict[tuple[str, bytes], set[tuple[str, bytes]]] = {}
+        self.results: dict[tuple[str, bytes], Any] = {}
+        self.failed: dict[tuple[str, bytes], BaseException] = {}
+        self.blocked: set[tuple[str, bytes]] = set()
+
+    def _collect(self, r: "Realizable") -> None:
+        k = _node_key(r)
+        if k in self.nodes:
+            return
+        if not isinstance(r, (Derivation, Expression)):
+            raise ValueError(f"Unknown realizable type: {type(r)}")
+        self.nodes[k] = r
+        self.deps[k] = [_node_key(d) for d in r.dependencies]
+        self.dependents.setdefault(k, set())
+        for d in r.dependencies:
+            self._collect(d)
+            self.dependents[_node_key(d)].add(k)
+
+    def _block(self, k: tuple[str, bytes]) -> None:
+        for dep_k in self.dependents[k]:
+            if dep_k not in self.blocked and dep_k not in self.results:
+                self.blocked.add(dep_k)
+                self._block(dep_k)
+
+    def run(self, roots: list["Realizable"]) -> list[Any]:
+        for r in roots:
+            self._collect(r)
+        pending = set(self.nodes)
+        running: dict[concurrent.futures.Future, tuple[str, bytes]] = {}
+        in_use: dict[str, int] = {}
+        total_slots = max(
+            1,
+            sum(
+                self.executor.capacity(n.pool)
+                for n in self.nodes.values()
+                if isinstance(n, Derivation)
+            ),
+        )
+        # Not a `with` block: on fail_fast we must raise without joining the
+        # builds still running (they finish in the background, holding their
+        # locks, and their outputs land in the store as usual).
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=total_slots)
+        try:
+            self._loop(pool, pending, running, in_use)
+        except BaseException:
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
+        if self.failed:
+            raise RealizeError(
+                {_label(self.nodes[k]): e for k, e in self.failed.items()},
+                sorted(_label(self.nodes[b]) for b in self.blocked),
+            )
+        return [self.results[_node_key(r)] for r in roots]
+
+    def _loop(self, pool, pending, running, in_use) -> None:
+        """Submit ready derivations (within pool capacity), evaluate ready
+        expressions inline, and reap completed builds until nothing is left."""
+        while pending or running:
+            # Submit / evaluate everything whose dependencies are done.
+            progressed = True
+            while progressed:
+                progressed = False
+                for k in sorted(pending, key=lambda k: self.nodes[k].hash):
+                    if k in self.blocked:
+                        pending.discard(k)
+                        progressed = True
+                        continue
+                    if any(d not in self.results for d in self.deps[k]):
+                        continue
+                    node = self.nodes[k]
+                    realized = [self.results[d] for d in self.deps[k]]
+                    if isinstance(node, Expression):
+                        # Expressions are cheap glue: evaluate inline, memoised for this run.
+                        pending.discard(k)
+                        try:
+                            self.results[k] = node.builder(realized)
+                        except BaseException as exc:
+                            self._fail(k, exc)
+                        progressed = True
+                        continue
+                    out = self.store_path / _label(node)
+                    if out.exists():
+                        pending.discard(k)
+                        self.results[k] = out
+                        progressed = True
+                        continue
+                    cap = self.executor.capacity(node.pool)
+                    if in_use.get(node.pool, 0) >= cap:
+                        continue
+                    in_use[node.pool] = in_use.get(node.pool, 0) + 1
+                    pending.discard(k)
+                    fut = pool.submit(
+                        _build_derivation,
+                        self.store_path,
+                        node,
+                        realized,
+                        self.executor,
+                    )
+                    running[fut] = k
+                    progressed = True
+            if not running:
+                if (
+                    pending
+                ):  # nothing runnable and nothing running: a cycle or an internal bug
+                    raise RuntimeError(
+                        f"realize: {len(pending)} node(s) can never become ready"
+                    )
+                break
+            done, _ = concurrent.futures.wait(
+                running, return_when=concurrent.futures.FIRST_COMPLETED
+            )
+            for fut in done:
+                k = running.pop(fut)
+                node = self.nodes[k]
+                in_use[node.pool] -= 1
+                try:
+                    self.results[k] = fut.result()
+                except BaseException as exc:
+                    self._fail(k, exc)
+                    if self.fail_fast:
+                        for f in running:
+                            f.cancel()
+                        raise RealizeError(
+                            {_label(node): exc},
+                            [_label(self.nodes[b]) for b in self.blocked],
+                        )
+
+    def _fail(self, k: tuple[str, bytes], exc: BaseException) -> None:
+        logger.error(f"failed: {_label(self.nodes[k])}: {exc!r}")
+        self.failed[k] = exc
+        self._block(k)
+
+
+@overload
+def realize(
+    store_path: Path,
+    expression: Expression[Result],
+    *,
+    executor: LocalExecutor | None = None,
+    fail_fast: bool = False,
+) -> Result: ...
+@overload
+def realize(
+    store_path: Path,
+    derivation: Derivation,
+    *,
+    executor: LocalExecutor | None = None,
+    fail_fast: bool = False,
+) -> Path: ...
+@overload
+def realize(
+    store_path: Path,
+    realizables: list["Realizable"],
+    *,
+    executor: LocalExecutor | None = None,
+    fail_fast: bool = False,
+) -> list[Any]: ...
+def realize(store_path, realizable, *, executor=None, fail_fast=False):
+    """Realize one node (returns its Path / value) or a list of nodes
+    (returns the list of their Paths / values), building whatever is missing.
+
+    The DAG under the roots is scheduled by dependency order; with an
+    ``executor`` whose pools have more than one slot, independent builds run
+    concurrently. A failed derivation blocks its dependents but nothing else;
+    when everything runnable has run, :class:`RealizeError` reports the
+    failures and the blocked nodes (``fail_fast=True`` raises at the first
+    failure instead).
+    """
+    store_path = Path(store_path)
+    single = isinstance(realizable, (Derivation, Expression))
+    roots = [realizable] if single else list(realizable)
+    results = _Scheduler(store_path, executor or LocalExecutor(), fail_fast).run(roots)
+    return results[0] if single else results
 
 
 def compute_hash(
@@ -251,8 +611,15 @@ def expression() -> (
 
 def derivation(
     name: str | Callable,
+    *,
+    pool: str = DEFAULT_POOL,
+    isolate: bool = False,
 ) -> Callable[[Callable[..., None]], Callable[..., Derivation]]:
     """Decorator: calling the wrapped function returns a Derivation node.
+
+    ``pool`` names the executor pool whose slot the build occupies (see
+    :class:`LocalExecutor`); ``isolate=True`` runs the builder in a fresh
+    interpreter.
 
     The constructed builder takes only the realized dependency values. During
     realization, the output path is made available via the ContextVar
@@ -277,8 +644,9 @@ def derivation(
                 name=der_name,
                 hash=compute_hash(func, der_name, args, kwargs),
                 dependencies=dependencies,
-                # builder returns None; output path is accessible via current_output_path
-                builder=builder,
+                builder=builder,  # returns None; writes to OUTPUT.get()
+                pool=pool,
+                isolate=isolate,
             )
 
         return wrapper
