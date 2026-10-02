@@ -376,3 +376,39 @@ def test_fail_fast_aborts_running_builds_and_releases_locks(store_path: Path):
         )
     assert time.time() - t0 < 5.0
     assert not list(store_path.glob("*.lock")) and not list(store_path.glob("*.tmp-*"))
+
+
+def test_slots_weigh_against_the_pool_budget(store_path: Path):
+    cur = {"n": 0}
+    peak = {"n": 0}
+    lock = threading.Lock()
+
+    def make(slots):
+        @derivation(lambda tag: f"{tag}.txt", pool="sim", slots=slots)
+        def f(tag: str) -> None:
+            with lock:
+                cur["n"] += slots
+                peak["n"] = max(peak["n"], cur["n"])
+            time.sleep(0.15)
+            with lock:
+                cur["n"] -= slots
+            output().write_text(tag)
+
+        return f
+
+    wide, narrow = make(3), make(1)
+    realize(
+        store_path,
+        Gather(wide("w1"), wide("w2"), *[narrow(f"n{i}") for i in range(4)]),
+        executor=LocalExecutor({"sim": 4}),
+    )
+    assert peak["n"] <= 4
+
+
+def test_slots_above_the_pool_capacity_are_rejected(store_path: Path):
+    @derivation("big.txt", pool="sim", slots=20)
+    def f() -> None:
+        output().write_text("x")
+
+    with pytest.raises(ValueError, match="needs 20 slots of pool 'sim', which has 4"):
+        realize(store_path, f(), executor=LocalExecutor({"sim": 4}))

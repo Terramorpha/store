@@ -81,8 +81,14 @@ class _Scheduler:
             raise ValueError(f"Unknown realizable type: {type(r)}")
         self.nodes[k] = r
         if isinstance(r, Derivation):
+            cap = self.executor.capacity(r.pool)
+            if r.slots > cap:
+                raise ValueError(
+                    f"{r.name} needs {r.slots} slots of pool {r.pool!r}, "
+                    f"which has {cap}"
+                )
             self.snapshot.builds[_label(r)] = BuildState(
-                label=_label(r), name=r.name, pool=r.pool
+                label=_label(r), name=r.name, pool=r.pool, slots=r.slots
             )
         self.deps[k] = [_node_key(d) for d in r.dependencies]
         self.dependents.setdefault(k, set())
@@ -200,7 +206,7 @@ class _Scheduler:
                 build = self.running.pop(k, None)
                 if build is None:  # finished after an abort: ignore
                     continue
-                in_use[self.nodes[k].pool] -= 1
+                in_use[self.nodes[k].pool] -= self.nodes[k].slots
                 if exc is None:
                     self.results[k] = result
                     self._set_status(build.label, "done", finished_at=time.time())
@@ -259,9 +265,9 @@ class _Scheduler:
                     progressed = True
                     continue
                 cap = self.executor.capacity(node.pool)
-                if in_use.get(node.pool, 0) >= cap:
+                if in_use.get(node.pool, 0) + node.slots > cap:
                     continue
-                in_use[node.pool] = in_use.get(node.pool, 0) + 1
+                in_use[node.pool] = in_use.get(node.pool, 0) + node.slots
                 pending.discard(k)
                 label = _label(node)
                 self._start(

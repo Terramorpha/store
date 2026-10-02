@@ -70,8 +70,9 @@ class RichReporter(Reporter):
         running.sort(key=lambda b: b.started_at or 0)
         table = Table(expand=True, show_edge=False, pad_edge=False)
         table.add_column("build", ratio=3, no_wrap=True)
-        table.add_column("pool", width=8)
+        table.add_column("pool", width=10)
         table.add_column("elapsed", width=8, justify="right")
+        table.add_column("eta", width=8, justify="right")
         table.add_column("progress", ratio=2)
         table.add_column("status", ratio=3, no_wrap=True)
         for b in running:
@@ -79,7 +80,11 @@ class RichReporter(Reporter):
                 bar = ProgressBar(total=1.0, completed=b.fraction, width=None)
             else:
                 bar = "waiting for lock" if b.status == "waiting" else ""
-            table.add_row(b.name, b.pool, _fmt_elapsed(b.elapsed), bar, b.text)
+            eta = ""
+            if b.fraction and b.elapsed:
+                eta = _fmt_elapsed(b.elapsed * (1.0 - b.fraction) / b.fraction)
+            pool = b.pool if b.slots == 1 else f"{b.pool} x{b.slots}"
+            table.add_row(b.name, pool, _fmt_elapsed(b.elapsed), eta, bar, b.text)
         n = {
             s: snap.count(s)
             for s in (

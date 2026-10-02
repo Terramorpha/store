@@ -35,7 +35,7 @@ def summarize(archive: Path, threshold: float) -> None:
 path = realize(
     Path("~/.cache/mystore").expanduser(),
     summarize(archive, threshold=0.5),
-    executor=LocalExecutor(),   # serial; always given explicitly
+    executor=LocalExecutor(),  # serial; always given explicitly
 )
 ```
 
@@ -70,11 +70,17 @@ def evaluate(checkpoint: Path) -> None: ...
 
 
 ex = LocalExecutor({"train": 3, "eval": 1}, default_pool_size=8)
-evals = realize(store, Gather(*[evaluate(train(cfg, s)) for s in range(3)]), executor=ex)
+evals = realize(
+    store, Gather(*[evaluate(train(cfg, s)) for s in range(3)]), executor=ex
+)
 ```
 
-* `pool`: the executor pool whose slot the build occupies (unlisted pools get
+* `pool`: the executor pool the build runs in (unlisted pools get
   `default_pool_size`). `LocalExecutor()` with no arguments is serial.
+* `slots`: how many of the pool's slots the build occupies, default 1. A
+  builder that is itself parallel (a script running 20 simulators) declares
+  `slots=20` so the pool budget stays honest; a node asking for more slots
+  than its pool has is rejected before anything runs.
 * `isolate=True`: the builder runs in a fresh interpreter (the closure and its
   realized inputs travel by cloudpickle), for crash isolation and for
   libraries that must not share process state.
@@ -110,7 +116,7 @@ thread, in an isolated child, or in any script a builder launches with
 reporter can only lose an update, never stall a build. The scheduler keeps a
 `BuildState` per node (status, pool, timings, progress) and hands snapshots to
 a `Reporter` passed as `realize(..., reporter=...)`. `store.ui.RichReporter`
-renders a live terminal table; `examples/demo_ui.py` is a synthetic graph to
+renders a live terminal table (elapsed, per-build ETA, progress bar, status); `examples/demo_ui.py` is a synthetic graph to
 look at it:
 
 ```

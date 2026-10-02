@@ -1,6 +1,6 @@
 [project]
 name = "store"
-version = "0.1.0"
+version = "0.2.0"
 description = "A tiny content-addressed build store: declare derivations as Python functions, realize them once into a hash-named store directory."
 readme = "README.md"
 license = { file = "LICENSE" }

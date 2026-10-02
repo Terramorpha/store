@@ -57,6 +57,7 @@ class BuildState:
     label: str
     name: str
     pool: str
+    slots: int = 1
     status: str = (
         "pending"  # pending | waiting | running | done | cached | failed | blocked
     )

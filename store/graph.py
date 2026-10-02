@@ -55,12 +55,15 @@ class Derivation:
     # Scheduling: which executor pool this build occupies a slot of, and whether
     # the builder must run in a fresh interpreter (crash / global-state isolation).
     pool: str = DEFAULT_POOL
+    slots: int = 1
     isolate: bool = False
 
     def __post_init__(self):
         assert Path(self.name).name == self.name, (
             "name of derivation can't contain a slash"
         )
+        if self.slots < 1:
+            raise ValueError(f"{self.name}: slots must be >= 1, got {self.slots}")
 
 
 Result = TypeVar("Result")
@@ -189,13 +192,15 @@ def derivation(
     name: str | Callable,
     *,
     pool: str = DEFAULT_POOL,
+    slots: int = 1,
     isolate: bool = False,
 ) -> Callable[[Callable[..., None]], Callable[..., Derivation]]:
     """Decorator: calling the wrapped function returns a Derivation node.
 
-    ``pool`` names the executor pool whose slot the build occupies (see
-    :class:`LocalExecutor`); ``isolate=True`` runs the builder in a fresh
-    interpreter.
+    ``pool`` names the executor pool the build runs in and ``slots`` how many
+    of that pool's slots it occupies (a script that runs 20 simulators itself
+    takes 20; see :class:`LocalExecutor`); ``isolate=True`` runs the builder
+    in a fresh interpreter.
 
     The constructed builder takes only the realized dependency values. During
     realization, the output path is made available via the ContextVar
@@ -222,6 +227,7 @@ def derivation(
                 dependencies=dependencies,
                 builder=builder,  # returns None; writes to output()
                 pool=pool,
+                slots=slots,
                 isolate=isolate,
             )
 
