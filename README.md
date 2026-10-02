@@ -87,6 +87,36 @@ evals = realize(store, Gather(*[evaluate(train(cfg, s)) for s in range(3)]), exe
   crash) waits for it instead of building it again; a lock whose heartbeat is
   older than `lock_stale_after` is taken over.
 
+## Progress
+
+The store owns progress reporting end to end. A builder gets its handle with
+`progress()`, the way it gets its output path with `output()`:
+
+```python
+@derivation("checkpoint", pool="train", isolate=True)
+def train(cfg) -> None:
+    p = progress()
+    p.total(cfg.updates)
+    for upd in range(cfg.updates):
+        ...
+        p.set(upd + 1)
+        p.status(f"return {ret:.1f}")
+```
+
+Every realization opens one abstract Unix datagram socket; every build, in a
+thread, in an isolated child, or in any script a builder launches with
+`subprocess.run(..., env=build_env())`, sends `KEY=VALUE` datagrams to it
+(`ID`, `DONE`, `TOTAL`, `STATUS`), non-blocking and coalesced, so a slow
+reporter can only lose an update, never stall a build. The scheduler keeps a
+`BuildState` per node (status, pool, timings, progress) and hands snapshots to
+a `Reporter` passed as `realize(..., reporter=...)`. `store.ui.RichReporter`
+renders a live terminal table; `examples/demo_ui.py` is a synthetic graph to
+look at it:
+
+```
+uv run python examples/demo_ui.py        # run twice: the second run is all cache hits
+```
+
 ## Development
 
 ```

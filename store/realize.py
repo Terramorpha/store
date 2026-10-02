@@ -6,11 +6,14 @@ semantics (RealizeError).
 import logging
 import queue
 import threading
+import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, overload
 
 from store.executor import LocalExecutor, _Aborted, _Build, _label, _node_key
 from store.graph import Derivation, Expression, Realizable, Result
+from store.progress import BuildState, ProgressServer, Reporter, Snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +47,21 @@ class _Scheduler:
     and the interrupt propagates. That is distinct from a build failing,
     which only blocks that build's dependents."""
 
-    def __init__(self, store_path: Path, executor: LocalExecutor, fail_fast: bool):
+    def __init__(
+        self,
+        store_path: Path,
+        executor: LocalExecutor,
+        fail_fast: bool,
+        reporter: Reporter | None = None,
+    ):
         self.store_path = store_path
         self.executor = executor
         self.fail_fast = fail_fast
+        self.reporter = reporter or Reporter()
+        self.snapshot = Snapshot(started_at=time.time())
+        self._state_lock = threading.Lock()
+        self._last_notify = 0.0
+        self.server = ProgressServer(self._on_progress)
         self.nodes: dict[tuple[str, bytes], Realizable] = {}
         self.deps: dict[tuple[str, bytes], list[tuple[str, bytes]]] = {}
         self.dependents: dict[tuple[str, bytes], set[tuple[str, bytes]]] = {}
@@ -66,21 +80,79 @@ class _Scheduler:
         if not isinstance(r, (Derivation, Expression)):
             raise ValueError(f"Unknown realizable type: {type(r)}")
         self.nodes[k] = r
+        if isinstance(r, Derivation):
+            self.snapshot.builds[_label(r)] = BuildState(
+                label=_label(r), name=r.name, pool=r.pool
+            )
         self.deps[k] = [_node_key(d) for d in r.dependencies]
         self.dependents.setdefault(k, set())
         for d in r.dependencies:
             self._collect(d)
             self.dependents[_node_key(d)].add(k)
 
+    # --- progress / state model ------------------------------------------
+    def _set_status(self, label: str, status: str, **fields: Any) -> None:
+        with self._state_lock:
+            st = self.snapshot.builds.get(label)
+            if st is None:
+                return
+            st.status = status
+            for name, value in fields.items():
+                setattr(st, name, value)
+        self._notify()
+
+    def _on_progress(self, build_id: str, fields: dict[str, str]) -> None:
+        with self._state_lock:
+            st = self.snapshot.builds.get(build_id)
+            if st is None:
+                return
+            try:
+                if "DONE" in fields:
+                    st.done = float(fields["DONE"])
+                if "TOTAL" in fields:
+                    st.total = float(fields["TOTAL"])
+            except ValueError:
+                pass
+            if "STATUS" in fields:
+                st.text = fields["STATUS"]
+        self._notify()
+
+    def _copy_snapshot(self) -> Snapshot:
+        """Reporters get a copy: a snapshot is a value, not a live view."""
+        with self._state_lock:
+            return Snapshot(
+                started_at=self.snapshot.started_at,
+                builds={k: replace(v) for k, v in self.snapshot.builds.items()},
+            )
+
+    def _notify(self, *, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - self._last_notify < 0.1:
+            return
+        self._last_notify = now
+        try:
+            self.reporter.update(self._copy_snapshot())
+        except Exception:  # noqa: BLE001 - a reporter bug must not break the build
+            logger.exception("reporter.update failed")
+
     def _block(self, k: tuple[str, bytes]) -> None:
         for dep_k in self.dependents[k]:
             if dep_k not in self.blocked and dep_k not in self.results:
                 self.blocked.add(dep_k)
+                if isinstance(self.nodes[dep_k], Derivation):
+                    self._set_status(_label(self.nodes[dep_k]), "blocked")
                 self._block(dep_k)
 
     def _fail(self, k: tuple[str, bytes], exc: BaseException) -> None:
         logger.error(f"failed: {_label(self.nodes[k])}: {exc!r}")
         self.failed[k] = exc
+        if isinstance(self.nodes[k], Derivation):
+            self._set_status(
+                _label(self.nodes[k]),
+                "failed",
+                finished_at=time.time(),
+                error=f"{type(exc).__name__}: {exc}",
+            )
         self._block(k)
 
     def _start(self, k: tuple[str, bytes], build: _Build) -> None:
@@ -93,6 +165,7 @@ class _Scheduler:
                 self.done_queue.put((k, result, None))
 
         self.running[k] = build
+        self._set_status(build.label, "running", started_at=time.time())
         threading.Thread(
             target=work, name=f"store-build-{build.derivation.name}", daemon=True
         ).start()
@@ -130,6 +203,7 @@ class _Scheduler:
                 in_use[self.nodes[k].pool] -= 1
                 if exc is None:
                     self.results[k] = result
+                    self._set_status(build.label, "done", finished_at=time.time())
                 elif isinstance(exc, _Aborted):
                     continue
                 else:
@@ -142,6 +216,12 @@ class _Scheduler:
             # stop everything that is running before propagating.
             self._abort_all()
             raise
+        finally:
+            self.server.close()
+            try:
+                self.reporter.close(self._copy_snapshot())
+            except Exception:  # noqa: BLE001
+                logger.exception("reporter.close failed")
         if self.failed:
             raise self._error()
         return self.results[_node_key(root)]
@@ -175,6 +255,7 @@ class _Scheduler:
                 if out.exists():
                     pending.discard(k)
                     self.results[k] = out
+                    self._set_status(_label(node), "cached")
                     progressed = True
                     continue
                 cap = self.executor.capacity(node.pool)
@@ -182,7 +263,20 @@ class _Scheduler:
                     continue
                 in_use[node.pool] = in_use.get(node.pool, 0) + 1
                 pending.discard(k)
-                self._start(k, _Build(self.store_path, node, realized, self.executor))
+                label = _label(node)
+                self._start(
+                    k,
+                    _Build(
+                        self.store_path,
+                        node,
+                        realized,
+                        self.executor,
+                        progress_socket=self.server.name,
+                        on_status=lambda status, label=label: self._set_status(
+                            label, status
+                        ),
+                    ),
+                )
                 progressed = True
 
 
@@ -193,6 +287,7 @@ def realize(
     *,
     executor: LocalExecutor,
     fail_fast: bool = False,
+    reporter: Reporter | None = None,
 ) -> Result: ...
 @overload
 def realize(
@@ -201,8 +296,9 @@ def realize(
     *,
     executor: LocalExecutor,
     fail_fast: bool = False,
+    reporter: Reporter | None = None,
 ) -> Path: ...
-def realize(store_path, realizable, *, executor, fail_fast=False):
+def realize(store_path, realizable, *, executor, fail_fast=False, reporter=None):
     """Realize one node: a derivation (returns its Path) or an expression
     (returns its value), building whatever is missing under it.
 
@@ -218,6 +314,11 @@ def realize(store_path, realizable, *, executor, fail_fast=False):
     raises at the first failure. A KeyboardInterrupt on the calling thread is
     preemption: running builds are aborted (isolated children killed, locks
     released, temp outputs removed) and the interrupt propagates at once.
+
+    ``reporter`` receives a :class:`~store.progress.Snapshot` of every
+    build's state whenever it changes (``store.ui.RichReporter`` renders a
+    live terminal table); builders report their own progress through
+    :func:`store.progress`.
     """
     if not isinstance(realizable, (Derivation, Expression)):
         raise TypeError(
@@ -228,5 +329,5 @@ def realize(store_path, realizable, *, executor, fail_fast=False):
         raise TypeError(
             f"executor must be a LocalExecutor, not {type(executor).__name__}"
         )
-    scheduler = _Scheduler(Path(store_path), executor, fail_fast)
+    scheduler = _Scheduler(Path(store_path), executor, fail_fast, reporter)
     return scheduler.run(realizable)

@@ -28,6 +28,7 @@ from store.graph import (
     expression,
     output,
 )
+from store.progress import BuildState, Reporter, Snapshot, build_env, progress
 from store.realize import RealizeError, realize
 
 __all__ = [
@@ -57,4 +58,9 @@ __all__ = [
     "hash_directory_tree",
     "output",
     "realize",
+    "progress",
+    "build_env",
+    "Reporter",
+    "Snapshot",
+    "BuildState",
 ]

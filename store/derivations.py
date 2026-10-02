@@ -13,7 +13,6 @@ from typing import Any
 
 import git
 import requests
-from rich.progress import DownloadColumn, Progress, TransferSpeedColumn
 
 from store.graph import (
     Derivation,
@@ -23,6 +22,7 @@ from store.graph import (
     expression,
     output,
 )
+from store.progress import progress
 
 
 def DownloadFile(
@@ -40,68 +40,60 @@ def DownloadFile(
 
     def builder(_):
         out = output()
+        report = progress()
+        report.status(f"downloading {filename}")
 
-        # Get progress object and create a task
+        hasher = hasher_factory()
+        # Verify TLS certificates by default.
+        #
+        # If your environment requires a custom CA bundle, set one of:
+        # - B2B_CA_BUNDLE=/path/to/ca-bundle.pem
+        # - REQUESTS_CA_BUNDLE=/path/to/ca-bundle.pem
+        # - SSL_CERT_FILE=/path/to/ca-bundle.pem
+        #
+        # To explicitly opt-out (NOT recommended), set:
+        # - B2B_INSECURE_SSL=1
+        verify: bool | str = True
+        if os.environ.get("B2B_INSECURE_SSL", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            verify = False
+        else:
+            ca_bundle = (
+                os.environ.get("B2B_CA_BUNDLE")
+                or os.environ.get("REQUESTS_CA_BUNDLE")
+                or os.environ.get("SSL_CERT_FILE")
+            )
+            if ca_bundle:
+                verify = ca_bundle
 
-        with Progress(
-            *Progress.get_default_columns(),
-            DownloadColumn(),
-            TransferSpeedColumn(),
-            transient=True,
-        ) as progress:
-            task = progress.add_task(f"Downloading {filename}", total=None)
+        response = requests.get(url, stream=True, verify=verify)
+        response.raise_for_status()
 
-            hasher = hasher_factory()
-            # Verify TLS certificates by default.
-            #
-            # If your environment requires a custom CA bundle, set one of:
-            # - B2B_CA_BUNDLE=/path/to/ca-bundle.pem
-            # - REQUESTS_CA_BUNDLE=/path/to/ca-bundle.pem
-            # - SSL_CERT_FILE=/path/to/ca-bundle.pem
-            #
-            # To explicitly opt-out (NOT recommended), set:
-            # - B2B_INSECURE_SSL=1
-            verify: bool | str = True
-            if os.environ.get("B2B_INSECURE_SSL", "").strip().lower() in (
-                "1",
-                "true",
-                "yes",
-            ):
-                verify = False
-            else:
-                ca_bundle = (
-                    os.environ.get("B2B_CA_BUNDLE")
-                    or os.environ.get("REQUESTS_CA_BUNDLE")
-                    or os.environ.get("SSL_CERT_FILE")
-                )
-                if ca_bundle:
-                    verify = ca_bundle
+        total_size = int(response.headers.get("content-length", 0))
+        if total_size > 0:
+            report.total(total_size)
 
-            response = requests.get(url, stream=True, verify=verify)
-            response.raise_for_status()
+        block_size = 1 << 16
+        received = 0
+        with tempfile.NamedTemporaryFile("wb", delete=False) as outfile:
+            for data in response.iter_content(block_size):
+                hasher.update(data)
+                outfile.write(data)
+                received += len(data)
+                report.set(received)
 
-            # Update task with actual file size if available
-            total_size = int(response.headers.get("content-length", 0))
-            if total_size > 0:
-                progress.update(task, total=total_size)
-
-            block_size = 1 << 16
-
-            with tempfile.NamedTemporaryFile("wb", delete=False) as outfile:
-                for data in response.iter_content(block_size):
-                    hasher.update(data)
-                    outfile.write(data)
-                    progress.update(task, advance=len(data))
-
-            outfile.close()
-            h = hasher.digest()
-            if hash is not None and hash != h:
-                raise Exception(
-                    f"Hash of download {filename} is wrong. "
-                    f"Expected: {hash.hex()}, actual: {h.hex()} "
-                    f"(computed using {hasher})"
-                )
-            shutil.move(outfile.name, out)
+        outfile.close()
+        h = hasher.digest()
+        if hash is not None and hash != h:
+            raise Exception(
+                f"Hash of download {filename} is wrong. "
+                f"Expected: {hash.hex()}, actual: {h.hex()} "
+                f"(computed using {hasher})"
+            )
+        shutil.move(outfile.name, out)
 
     return Derivation(filename, derivation_hash, [], builder)
 

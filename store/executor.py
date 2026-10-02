@@ -14,11 +14,13 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from store.graph import _OUTPUT, Derivation, Realizable
+from store.progress import _BUILD, ENV_BUILD_ID, ENV_SOCKET
 
 logger = logging.getLogger(__name__)
 
@@ -88,11 +90,17 @@ class _Build:
         derivation: Derivation,
         realized_deps: list[Any],
         executor: LocalExecutor,
+        *,
+        progress_socket: str | None = None,
+        on_status: Callable[[str], None] | None = None,
     ):
         self.store_path = store_path
         self.derivation = derivation
         self.realized_deps = realized_deps
         self.executor = executor
+        self.label = _label(derivation)
+        self.progress_socket = progress_socket
+        self.on_status = on_status or (lambda status: None)
         self.output_path = store_path / _label(derivation)
         self.tmp_output_path = (
             store_path / f"{_label(derivation)}.tmp-{os.getpid()}-{uuid4().hex}"
@@ -107,10 +115,16 @@ class _Build:
         if self.output_path.exists():
             return self.output_path
         self.store_path.mkdir(parents=True, exist_ok=True)
-        self.lock = _BuildLock(self.output_path, self.executor, self.aborted)
+        self.lock = _BuildLock(
+            self.output_path,
+            self.executor,
+            self.aborted,
+            on_wait=lambda: self.on_status("waiting"),
+        )
         if not self.lock.acquire():
             return self.output_path
         try:
+            self.on_status("running")
             logger.info(f"building {self.derivation.name}")
             self._call_builder()
             if self.aborted.is_set():
@@ -142,9 +156,13 @@ class _Build:
             self._run_isolated()
             return
         token = _OUTPUT.set(self.tmp_output_path)
+        token_b = _BUILD.set(
+            (self.progress_socket, self.label) if self.progress_socket else None
+        )
         try:
             self.derivation.builder(self.realized_deps)
         finally:
+            _BUILD.reset(token_b)
             _OUTPUT.reset(token)
 
     def _run_isolated(self) -> None:
@@ -162,11 +180,16 @@ class _Build:
                 (self.derivation.builder, self.realized_deps, self.tmp_output_path), f
             )
         try:
+            env = dict(os.environ)
+            if self.progress_socket:
+                env[ENV_SOCKET] = self.progress_socket
+                env[ENV_BUILD_ID] = self.label
             self.proc = subprocess.Popen(
                 [sys.executable, "-m", "store._isolated", payload],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env=env,
             )
             _out, err = self.proc.communicate()
         finally:
@@ -207,8 +230,15 @@ class _BuildLock:
     older than ``lock_stale_after`` belongs to a dead build and is taken over."""
 
     def __init__(
-        self, output_path: Path, executor: LocalExecutor, aborted: threading.Event
+        self,
+        output_path: Path,
+        executor: LocalExecutor,
+        aborted: threading.Event,
+        *,
+        on_wait: Callable[[], None] | None = None,
     ):
+        self.on_wait = on_wait
+        self._waited = False
         self.path = output_path.with_name(output_path.name + ".lock")
         self.output_path = output_path
         self.executor = executor
@@ -237,6 +267,9 @@ class _BuildLock:
                     )
                     self.path.unlink(missing_ok=True)
                     continue
+                if not self._waited and self.on_wait is not None:
+                    self._waited = True
+                    self.on_wait()
                 time.sleep(self.executor.poll)
                 continue
             with os.fdopen(fd, "w") as f:
