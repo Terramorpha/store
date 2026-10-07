@@ -208,3 +208,76 @@ def test_build_env_inside_a_build_carries_socket_and_id(store_path: Path):
     assert (
         os.environ.get("STORE_PROGRESS_SOCKET") is None
     )  # never leaked into the parent env
+
+
+def test_log_reporter_writes_transitions_and_status(store_path: Path, tmp_path: Path):
+    from store import LogReporter, MultiReporter
+
+    @derivation("a.txt")
+    def a() -> None:
+        p = progress()
+        p.total(2)
+        p.set(1)
+        output().write_text("a")
+
+    @derivation("b.txt")
+    def b() -> None:
+        raise ValueError("boom")
+
+    @derivation("c.txt")
+    def c(x: Path) -> None:
+        output().write_text("never")
+
+    log, status = tmp_path / "events.log", tmp_path / "status.json"
+    rec = Recorder()
+    rep = MultiReporter(rec, LogReporter(log, status, period=0.0))
+    with pytest.raises(RealizeError):
+        realize(store_path, Gather(a(), c(b())), executor=LocalExecutor(), reporter=rep)
+
+    lines = log.read_text().splitlines()
+    assert lines[0].split()[1] == "start" and "3 nodes" in lines[0]
+    assert any(" done     a.txt" in ln and "elapsed=" in ln for ln in lines)
+    assert any(
+        " failed   b.txt" in ln and "error=ValueError: boom" in ln for ln in lines
+    )
+    assert any(" blocked  c.txt" in ln for ln in lines)
+    assert lines[-1].split()[1] == "end" and "failed 1" in lines[-1]
+    # every transition appears once
+    assert sum(" done     a.txt" in ln for ln in lines) == 1
+
+    import json
+
+    doc = json.loads(status.read_text())
+    assert doc["counts"] == {
+        "done": 1,
+        "cached": 0,
+        "running": 0,
+        "waiting": 0,
+        "pending": 0,
+        "failed": 1,
+        "blocked": 1,
+    }
+    assert doc["failed"][0]["name"] == "b.txt" and "boom" in doc["failed"][0]["error"]
+    assert doc["blocked"] == ["c.txt"] and doc["running"] == []
+    assert doc["summary"].startswith("done 1")
+    assert rec.closed is not None  # the other reporter in the fan-out ran too
+
+
+def test_snapshot_eta_and_summary():
+    from store.progress import BuildState
+
+    now = time.time()
+    snap = Snapshot(started_at=now - 100)
+    snap.builds["x"] = BuildState(
+        "x", "x", "p", status="done", started_at=now - 60, finished_at=now - 10
+    )
+    snap.builds["y"] = BuildState(
+        "y", "y", "p", status="running", started_at=now - 20, done=1, total=4
+    )
+    snap.builds["z"] = BuildState("z", "z", "p", status="pending")
+    assert snap.counts()["done"] == 1 and snap.counts()["pending"] == 1
+    # mean 50 s per build, 2 left, 1 active slot
+    assert abs(snap.eta() - 100.0) < 1e-6
+    assert abs(snap.builds["y"].eta - 60.0) < 1.0
+    assert snap.summary().startswith("done 1  cached 0  running 1")
+    assert "left" in snap.summary()

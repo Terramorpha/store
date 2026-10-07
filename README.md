@@ -115,13 +115,30 @@ thread, in an isolated child, or in any script a builder launches with
 (`ID`, `DONE`, `TOTAL`, `STATUS`), non-blocking and coalesced, so a slow
 reporter can only lose an update, never stall a build. The scheduler keeps a
 `BuildState` per node (status, pool, timings, progress) and hands snapshots to
-a `Reporter` passed as `realize(..., reporter=...)`. `store.ui.RichReporter`
-renders a live terminal table (elapsed, per-build ETA, progress bar, status); `examples/demo_ui.py` is a synthetic graph to
-look at it:
+a `Reporter` passed as `realize(..., reporter=...)`. Two reporters ship, and
+`MultiReporter(a, b)` runs both:
 
-```
-uv run python examples/demo_ui.py        # run twice: the second run is all cache hits
-```
+* `store.ui.RichReporter` renders a live terminal table (elapsed, per-build
+  ETA, progress bar, status); `examples/demo_ui.py` is a synthetic graph to
+  look at it:
+
+  ```
+  uv run python examples/demo_ui.py        # run twice: the second run is all cache hits
+  ```
+
+* `LogReporter(log, status)` writes for readers that are not a terminal: an
+  append-only log with one line per state transition (`start`, `running`,
+  `done`, `cached`, `failed`, `blocked`, `end`, each with a wall-clock time,
+  the pool and, for finished builds, the elapsed time and the error), and a
+  JSON status file rewritten atomically every `period` seconds with counts,
+  elapsed, overall ETA, the running builds with their fraction and ETA, and
+  the pending and failed ones. `grep failed` and `cat status.json` answer
+  the usual questions without a terminal.
+
+Both use the same `Snapshot.eta()` / `Snapshot.summary()`, so they never
+disagree. The overall ETA is the mean duration of the builds finished so far,
+times the builds left, over the slots in use: it knows nothing about a
+pending build but that it exists.
 
 ## Development
 

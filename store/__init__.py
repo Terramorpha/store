@@ -28,7 +28,15 @@ from store.graph import (
     expression,
     output,
 )
-from store.progress import BuildState, Reporter, Snapshot, build_env, progress
+from store.logreport import LogReporter
+from store.progress import (
+    BuildState,
+    MultiReporter,
+    Reporter,
+    Snapshot,
+    build_env,
+    progress,
+)
 from store.realize import RealizeError, realize
 
 __all__ = [
@@ -61,6 +69,8 @@ __all__ = [
     "progress",
     "build_env",
     "Reporter",
+    "MultiReporter",
+    "LogReporter",
     "Snapshot",
     "BuildState",
 ]

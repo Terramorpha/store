@@ -5,25 +5,13 @@ the scheduler itself never imports rich."""
 from __future__ import annotations
 
 import threading
-import time
 
 from rich.console import Console
 from rich.live import Live
 from rich.progress_bar import ProgressBar
 from rich.table import Table
 
-from store.progress import Reporter, Snapshot
-
-
-def _fmt_elapsed(s: float | None) -> str:
-    if s is None:
-        return ""
-    s = int(s)
-    return (
-        f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}"
-        if s >= 3600
-        else f"{s // 60}:{s % 60:02d}"
-    )
+from store.progress import Reporter, Snapshot, fmt_elapsed
 
 
 class RichReporter(Reporter):
@@ -80,35 +68,8 @@ class RichReporter(Reporter):
                 bar = ProgressBar(total=1.0, completed=b.fraction, width=None)
             else:
                 bar = "waiting for lock" if b.status == "waiting" else ""
-            eta = ""
-            if b.fraction and b.elapsed:
-                eta = _fmt_elapsed(b.elapsed * (1.0 - b.fraction) / b.fraction)
+            eta = fmt_elapsed(b.eta) if b.eta is not None else ""
             pool = b.pool if b.slots == 1 else f"{b.pool} x{b.slots}"
-            table.add_row(b.name, pool, _fmt_elapsed(b.elapsed), eta, bar, b.text)
-        n = {
-            s: snap.count(s)
-            for s in (
-                "done",
-                "cached",
-                "running",
-                "waiting",
-                "pending",
-                "failed",
-                "blocked",
-            )
-        }
-        finished = [b for b in snap.builds.values() if b.status == "done" and b.elapsed]
-        eta = ""
-        left = n["pending"] + n["running"] + n["waiting"]
-        if finished and left:
-            mean = sum(b.elapsed for b in finished) / len(finished)
-            slots = max(1, n["running"] + n["waiting"])
-            eta = f"  ~{_fmt_elapsed(mean * left / slots)} left"
-        elapsed = _fmt_elapsed(time.time() - snap.started_at)
-        summary = (
-            f"done {n['done']}  cached {n['cached']}  running {n['running']}  "
-            f"waiting {n['waiting']}  pending {n['pending']}  failed {n['failed']}  "
-            f"blocked {n['blocked']}  elapsed {elapsed}{eta}"
-        )
-        table.caption = summary
+            table.add_row(b.name, pool, fmt_elapsed(b.elapsed), eta, bar, b.text)
+        table.caption = snap.summary()
         return table

@@ -23,6 +23,7 @@ hands ``(build_id, fields)`` to a callback.
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import socket
 import threading
@@ -39,6 +40,7 @@ ENV_BUILD_ID = "STORE_BUILD_ID"
 _BUILD: ContextVar[tuple[str, str] | None] = ContextVar("STORE_BUILD", default=None)
 
 _COALESCE_S = 0.1
+logger = logging.getLogger(__name__)
 
 
 def _socket_address(name: str) -> bytes | str:
@@ -48,6 +50,18 @@ def _socket_address(name: str) -> bytes | str:
 
 
 # --- state model (owned by the scheduler, rendered by reporters) ---------------
+
+STATUSES = ("done", "cached", "running", "waiting", "pending", "failed", "blocked")
+
+
+def fmt_elapsed(seconds: float | None) -> str:
+    """``--`` / ``4:05`` / ``2h15m``: short enough for a table column."""
+    if seconds is None:
+        return "--"
+    s = int(seconds)
+    if s >= 3600:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    return f"{s // 60}:{s % 60:02d}"
 
 
 @dataclass
@@ -80,6 +94,15 @@ class BuildState:
             return None
         return max(0.0, min(1.0, self.done / self.total))
 
+    @property
+    def eta(self) -> float | None:
+        """Seconds left for this build, from its own progress; None without a
+        reported total or before any progress."""
+        f, e = self.fraction, self.elapsed
+        if not f or not e:
+            return None
+        return e * (1.0 - f) / f
+
 
 @dataclass
 class Snapshot:
@@ -90,6 +113,39 @@ class Snapshot:
 
     def count(self, status: str) -> int:
         return sum(1 for b in self.builds.values() if b.status == status)
+
+    def counts(self) -> dict[str, int]:
+        return {s: self.count(s) for s in STATUSES}
+
+    @property
+    def elapsed(self) -> float:
+        return time.time() - self.started_at
+
+    def eta(self) -> float | None:
+        """Seconds left for the whole realization: mean duration of the builds
+        finished so far, times the builds not finished, over the builds
+        currently holding a slot. None until one build has finished or when
+        nothing is left. Pending builds are counted as if they took as long
+        as the finished ones, which is all the scheduler knows."""
+        finished = [
+            b.elapsed for b in self.builds.values() if b.status == "done" and b.elapsed
+        ]
+        n = self.counts()
+        left = n["pending"] + n["running"] + n["waiting"]
+        if not finished or not left:
+            return None
+        active = max(1, n["running"] + n["waiting"])
+        return sum(finished) / len(finished) * left / active
+
+    def summary(self) -> str:
+        """One line: counts by status, elapsed, overall ETA."""
+        n = self.counts()
+        line = (
+            "  ".join(f"{s} {n[s]}" for s in STATUSES)
+            + f"  elapsed {fmt_elapsed(self.elapsed)}"
+        )
+        eta = self.eta()
+        return line + (f"  ~{fmt_elapsed(eta)} left" if eta is not None else "")
 
 
 class Reporter:
@@ -102,6 +158,29 @@ class Reporter:
 
     def close(self, snapshot: Snapshot) -> None:  # noqa: B027
         pass
+
+
+class MultiReporter(Reporter):
+    """Fan one realization out to several reporters (a terminal dashboard and
+    a log file, say). Each call reaches every reporter; one raising does not
+    stop the others."""
+
+    def __init__(self, *reporters: Reporter):
+        self.reporters = reporters
+
+    def update(self, snapshot: Snapshot) -> None:
+        for r in self.reporters:
+            try:
+                r.update(snapshot)
+            except Exception:  # noqa: BLE001
+                logger.exception("reporter.update failed: %r", r)
+
+    def close(self, snapshot: Snapshot) -> None:
+        for r in self.reporters:
+            try:
+                r.close(snapshot)
+            except Exception:  # noqa: BLE001
+                logger.exception("reporter.close failed: %r", r)
 
 
 # --- client -----------------------------------------------------------------
