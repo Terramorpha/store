@@ -16,6 +16,7 @@ from store.graph import Derivation, Expression, Realizable, Result
 from store.progress import BuildState, ProgressServer, Reporter, Snapshot
 
 logger = logging.getLogger(__name__)
+HEARTBEAT = 1.0  # seconds between reporter ticks while a build runs
 
 
 class RealizeError(Exception):
@@ -60,7 +61,10 @@ class _Scheduler:
         self.reporter = reporter or Reporter()
         self.snapshot = Snapshot(started_at=time.time())
         self._state_lock = threading.Lock()
+        self._notify_lock = threading.Lock()
         self._last_notify = 0.0
+        self._dirty = False  # a throttled update is owed to the reporter
+        self._stop = threading.Event()
         self.server = ProgressServer(self._on_progress)
         self.nodes: dict[tuple[str, bytes], Realizable] = {}
         self.deps: dict[tuple[str, bytes], list[tuple[str, bytes]]] = {}
@@ -105,7 +109,7 @@ class _Scheduler:
             st.status = status
             for name, value in fields.items():
                 setattr(st, name, value)
-        self._notify()
+        self._notify(force=True)  # a transition is never dropped
 
     def _on_progress(self, build_id: str, fields: dict[str, str]) -> None:
         with self._state_lock:
@@ -132,14 +136,27 @@ class _Scheduler:
             )
 
     def _notify(self, *, force: bool = False) -> None:
-        now = time.time()
-        if not force and now - self._last_notify < 0.1:
-            return
-        self._last_notify = now
-        try:
-            self.reporter.update(self._copy_snapshot())
-        except Exception:  # noqa: BLE001 - a reporter bug must not break the build
-            logger.exception("reporter.update failed")
+        """Hand the reporter a fresh snapshot. Progress events are throttled
+        to one update per 0.1 s; a throttled one is owed and delivered by the
+        next forced call (a transition or the heartbeat), never lost."""
+        with self._notify_lock:
+            now = time.time()
+            if not force and now - self._last_notify < 0.1:
+                self._dirty = True
+                return
+            self._last_notify = now
+            self._dirty = False
+            try:
+                self.reporter.update(self._copy_snapshot())
+            except Exception:  # noqa: BLE001 - a reporter bug must not break the build
+                logger.exception("reporter.update failed")
+
+    def _heartbeat(self) -> None:
+        """Flush owed progress and give time-based reporters a tick, every
+        HEARTBEAT seconds while the build runs (a run with no progress events
+        would otherwise leave them with a stale picture)."""
+        while not self._stop.wait(HEARTBEAT):
+            self._notify(force=True)
 
     def _block(self, k: tuple[str, bytes]) -> None:
         for dep_k in self.dependents[k]:
@@ -191,6 +208,9 @@ class _Scheduler:
         self._collect(root)
         pending = set(self.nodes)
         in_use: dict[str, int] = {}
+        threading.Thread(
+            target=self._heartbeat, name="store-heartbeat", daemon=True
+        ).start()
         try:
             while pending or self.running:
                 self._submit_ready(pending, in_use)
@@ -223,6 +243,7 @@ class _Scheduler:
             self._abort_all()
             raise
         finally:
+            self._stop.set()
             self.server.close()
             try:
                 self.reporter.close(self._copy_snapshot())

@@ -117,6 +117,46 @@ def test_in_thread_builder_progress_reaches_the_snapshot(store_path: Path):
     assert any(s.count("running") == 1 for s in rec.snapshots)
 
 
+def test_every_transition_reaches_the_reporter(store_path: Path):
+    """Three builds start in the same instant: each start and finish is a
+    separate reporter update (transitions are never throttled away)."""
+    rec = Recorder()
+
+    @derivation(lambda k: f"quick_{k}", pool="p")
+    def quick(k: int) -> None:
+        output().write_text(str(k))
+
+    realize(
+        store_path,
+        Gather(*[quick(k) for k in range(3)]),
+        executor=LocalExecutor({"p": 3}),
+        reporter=rec,
+    )
+    seen = {f"quick_{k}": set() for k in range(3)}
+    for snap in rec.snapshots:
+        for st in snap.builds.values():
+            if st.name in seen:
+                seen[st.name].add(st.status)
+    assert all({"running", "done"} <= v for v in seen.values()), seen
+
+
+def test_heartbeat_keeps_updating_a_quiet_build(store_path: Path):
+    """A build that reports no progress still produces periodic reporter
+    updates while it runs (time-based reporters need the tick)."""
+    rec = Recorder()
+
+    @derivation("quiet.txt")
+    def quiet() -> None:
+        time.sleep(2.6)
+        output().write_text("ok")
+
+    realize(store_path, quiet(), executor=LocalExecutor(), reporter=rec)
+    running = [
+        s for s in rec.snapshots if next(iter(s.builds.values())).status == "running"
+    ]
+    assert len(running) >= 3, len(running)
+
+
 def test_isolated_builder_progress_reaches_the_snapshot(store_path: Path):
     rec = Recorder()
 
